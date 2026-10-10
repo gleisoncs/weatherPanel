@@ -61,11 +61,17 @@
     height: auto;
     aspect-ratio: 1200 / 825;
     background: #e6e6df;
-    transition: none;
   }
-  canvas.flash-invert { filter: invert(1); }
-  canvas.flash-black { filter: brightness(0); }
-  canvas.flash-white { filter: brightness(0) invert(1); }
+  .device { position: relative; }
+  /* snapshot of the previous frame, faded out over the new one on refresh */
+  #overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    background: transparent;
+  }
+  @media (prefers-reduced-motion: reduce) { #overlay { display: none; } }
   footer { color: var(--muted); font-size: 12px; margin-top: 10px; text-align: center; }
   footer a { color: inherit; }
 </style>
@@ -87,6 +93,7 @@
 
   <div class="device" id="device">
     <canvas id="panel" width="1200" height="825" role="img" aria-label="Weather panel"></canvas>
+    <canvas id="overlay" width="1200" height="825" aria-hidden="true"></canvas>
   </div>
   <footer>Weather data by <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a> · auto-refresh every <span id="every">15</span> min</footer>
 
@@ -797,14 +804,21 @@ async function resolveLocation() {
   return state.loc;
 }
 
-function flash(draw) {
-  // imitate a full e-paper refresh: inverted -> black -> white -> new image
-  const seq = ["flash-invert", "flash-black", "flash-white"];
-  seq.forEach((cls, k) => setTimeout(() => { canvas.className = cls; if (k === 2) draw(); }, k * 110));
-  setTimeout(() => { canvas.className = ""; }, seq.length * 110);
+const overlay = document.getElementById("overlay");
+function swap(draw) {
+  // cross-fade: cover the canvas with a copy of the old frame, draw the new frame below, fade the copy out
+  overlay.width = canvas.width;
+  overlay.height = canvas.height;
+  overlay.getContext("2d").drawImage(canvas, 0, 0);
+  overlay.style.transition = "none";
+  overlay.style.opacity = "1";
+  draw();
+  overlay.getBoundingClientRect(); // commit opacity 1 before starting the fade
+  overlay.style.transition = "opacity 0.5s ease";
+  overlay.style.opacity = "0";
 }
 
-async function update(withFlash = true) {
+async function update() {
   if (state.busy) return;
   state.busy = true;
   let draw;
@@ -822,16 +836,16 @@ async function update(withFlash = true) {
   } finally {
     state.busy = false;
   }
-  withFlash && state.last ? flash(draw) : draw();
+  swap(draw);
   clearTimeout(state.timer);
-  state.timer = setTimeout(() => update(true), state.refreshMin * 60e3);
+  state.timer = setTimeout(() => update(), state.refreshMin * 60e3);
 }
 
 function changeLocation(patch) {
   Object.assign(state, patch, { loc: null, last: null });
   store.set("wp.city", state.city);
   syncUrl();
-  update(false);
+  update();
 }
 
 document.getElementById("cityForm").addEventListener("submit", e => {
@@ -843,9 +857,9 @@ $units.addEventListener("change", () => {
   state.units = $units.value;
   store.set("wp.units", state.units);
   syncUrl();
-  update(false);
+  update();
 });
-document.getElementById("refresh").addEventListener("click", () => update(true));
+document.getElementById("refresh").addEventListener("click", () => update());
 document.getElementById("geo").addEventListener("click", () => {
   if (!navigator.geolocation) return alert("Geolocation is not available in this browser.");
   navigator.geolocation.getCurrentPosition(
@@ -855,7 +869,7 @@ document.getElementById("geo").addEventListener("click", () => {
 });
 document.addEventListener("keydown", e => {
   if (e.target.matches("input, select")) return;
-  if (e.key === "r" || e.key === "R") update(true);
+  if (e.key === "r" || e.key === "R") update();
   if (e.key === "f" || e.key === "F") {
     const el = document.getElementById("device");
     document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.();
@@ -863,13 +877,13 @@ document.addEventListener("keydown", e => {
 });
 document.addEventListener("visibilitychange", () => {
   // browsers throttle timers in background tabs; catch up when the tab is shown again
-  if (!document.hidden && state.last && Date.now() - state.last.fetchedAt > state.refreshMin * 60e3) update(true);
+  if (!document.hidden && state.last && Date.now() - state.last.fetchedAt > state.refreshMin * 60e3) update();
 });
 
 setupCanvas();
 renderMessage("Loading...", "Fetching weather from Open-Meteo");
 syncUrl();
-update(false);
+update();
 </script>
 </body>
 </html>
