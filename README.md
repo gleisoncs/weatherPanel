@@ -12,7 +12,9 @@ looks and refreshes like an e-paper display. Data comes from
 - Conditions: icon, visibility, cloud cover, humidity, dew point
 - Temperature (now, max/min, feels like), pressure with 3 h trend, precipitation (today's total, chance, next rain)
 - Description and UV index, date, last update time, sunrise/sunset, day length, moon phase
-- Hourly strip: 36 h in 3 h steps (icon, temperature, rain mm, rain chance)
+- Hourly strip: 36 h in 3 h blocks starting now (rain summed over each block, highest chance)
+- Live radar from [RainViewer](https://www.rainviewer.com/api.html): if radar sees rain at your
+  location the panel shows "Raining now" even when the forecast model says dry
 - 7-day forecast: icon, max/min, rain, chance, UV, max wind
 - 3-day charts: temperature, humidity, pressure, rainfall (mm per 3 h), cloud cover,
   each with its average over the period (in the title and as a dashed `avg` line)

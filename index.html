@@ -104,6 +104,11 @@ const W = 1200, H = 825, M = 8;
 const INK = "#222226", PAPER = "#e6e6df";
 const GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search";
 const FORECAST_URL = "https://api.open-meteo.com/v1/forecast";
+const RADAR_URL = "https://api.rainviewer.com/public/weather-maps.json";
+const RADAR_ZOOM = 7;          // ~1 km per pixel; highest zoom RainViewer serves for free
+const RADAR_HERE_PX = 1;       // 3x3 px around the location (~3 km)
+const RADAR_NEAR_PX = 9;       // ~10 km radius
+const RADAR_MAX_AGE_MIN = 40;
 const CURRENT_VARS = ["temperature_2m","relative_humidity_2m","apparent_temperature","is_day","precipitation",
   "weather_code","cloud_cover","pressure_msl","wind_speed_10m","wind_direction_10m","wind_gusts_10m"];
 const HOURLY_VARS = ["temperature_2m","relative_humidity_2m","dew_point_2m","precipitation","precipitation_probability",
@@ -173,6 +178,52 @@ async function fetchWeather(loc, units) {
   }
   return parseWeather(await r.json(), loc, units);
 }
+
+// Live radar (RainViewer): models often miss local showers, radar shows what is falling right now.
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("radar tile failed to load"));
+    img.src = url;
+  });
+}
+
+async function fetchRadar(lat, lon) {
+  const meta = await (await fetch(RADAR_URL)).json();
+  const frame = meta.radar && meta.radar.past && meta.radar.past[meta.radar.past.length - 1];
+  if (!frame) return null;
+  const time = new Date(frame.time * 1000);
+  if (Date.now() - time > RADAR_MAX_AGE_MIN * 60e3) return null;
+  const n = 2 ** RADAR_ZOOM, lr = lat * Math.PI / 180;
+  const xf = (lon + 180) / 360 * n;
+  const yf = (1 - Math.asinh(Math.tan(lr)) / Math.PI) / 2 * n;
+  const tx = Math.floor(xf), ty = Math.floor(yf);
+  const px = Math.floor((xf - tx) * 256), py = Math.floor((yf - ty) * 256);
+  const img = await loadImage(`${meta.host}${frame.path}/256/${RADAR_ZOOM}/${tx}/${ty}/2/0_0.png`);
+  const c = document.createElement("canvas");
+  c.width = c.height = 256;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(img, 0, 0);
+  const data = g.getImageData(0, 0, 256, 256).data;
+  const wetWithin = r => {
+    for (let y = Math.max(0, py - r); y <= Math.min(255, py + r); y++)
+      for (let x = Math.max(0, px - r); x <= Math.min(255, px + r); x++)
+        if ((x - px) ** 2 + (y - py) ** 2 <= r * r + 1 && data[(y * 256 + x) * 4 + 3] > 0) return true;
+    return false;
+  };
+  const here = wetWithin(RADAR_HERE_PX);
+  return { here, near: here || wetWithin(RADAR_NEAR_PX), time };
+}
+
+const WET_KINDS = new Set(["drizzle", "rain", "sleet", "snow", "thunder"]);
+// Current weather code, corrected by radar when the model says dry but rain is being observed.
+function nowCode(wx) {
+  const code = wx.current.weather_code;
+  return wx.radar && wx.radar.here && !WET_KINDS.has(classify(code)[0]) ? 61 : code;
+}
+const radarOverrides = wx => nowCode(wx) !== wx.current.weather_code;
 
 function parseWeather(j, loc, units) {
   const cur = { ...j.current };
@@ -536,7 +587,7 @@ function conditionsPanel(wx, box) {
   text(`${fmt(vis, (vis ?? 0) >= 10 ? 0 : 1)} ${u.vis}`, x0 + 42, ty, 16, true, "l");
   cloud(x1 - 92, ty, 30, 2);
   text(`${fmt(cur.cloud_cover)}%`, x1 - 72, ty, 16, true, "l");
-  drawIcon(cur.weather_code, cx, y0 + 110, 142, !!(cur.is_day ?? 1));
+  drawIcon(nowCode(wx), cx, y0 + 110, 142, !!(cur.is_day ?? 1));
   const hum = `${fmt(cur.relative_humidity_2m)}%`;
   const hw = textW(hum, 34, true);
   text(hum, cx - 12, y1 - 50, 34, true);
@@ -582,12 +633,17 @@ function precipCell(wx, box) {
   for (let i = 0; i < 24 && i < wx.hourly.precipitation.length; i++) {
     if ((wx.hourly.precipitation[i] ?? 0) >= thr && (wx.hourly.precipitation_probability[i] ?? 0) >= 40) { next = i; break; }
   }
-  text(next < 0 ? "Dry next 24 h" : next === 0 ? "Rain now" : `Rain expected in ${next} h`, cx, y0 + 114, 15);
+  const radar = wx.radar;
+  const ago = radar ? Math.max(0, Math.round((Date.now() - radar.time) / 60e3)) : 0;
+  const msg = radar && radar.here ? `Raining now · radar ${ago} min ago`
+    : radar && radar.near ? `Rain nearby · radar ${ago} min ago`
+    : next < 0 ? "Dry next 24 h" : next === 0 ? "Rain now" : `Rain expected in ${next} h`;
+  text(msg, cx, y0 + 114, fit(msg, x1 - x0 - 10, 15));
 }
 
 function summaryBar(wx, box) {
   const [x0, y0, x1, y1] = panel(box), cy = (y0 + y1) / 2;
-  const desc = WMO_TEXT[wx.current.weather_code] || "Unknown";
+  const desc = radarOverrides(wx) ? "Rain (seen on radar)" : WMO_TEXT[wx.current.weather_code] || "Unknown";
   const uv = wx.current.uv_index;
   const right = uv != null ? `UV ${fmtG(uv)} ${uvLabel(uv)}` : "";
   text(right, x1 - 14, cy, 18, true, "r");
@@ -616,15 +672,20 @@ function hourlyStrip(wx, y0, y1, n = 12, step = 3) {
   const hr = wx.hourly, u = wx.units, gap = 4;
   const cw = (W - 2 * M - gap * (n - 1)) / n;
   for (let k = 0; k < n; k++) {
-    const i = 1 + k * step;
+    // each cell covers `step` hours starting at the current hour: rain is summed, chance is the max
+    const i = k * step;
     if (i >= hr.time.length) break;
+    const win = key => hr[key].slice(i, i + step).filter(v => v != null);
     const x0 = M + k * (cw + gap), x1 = x0 + cw, cx = (x0 + x1) / 2;
     strokeRect(x0, y0, x1, y1);
     line([[x0, y0 + 24], [x1, y0 + 24]]);
-    text(hhmm(hr.time[i]), cx, y0 + 13, 16, true);
-    drawIcon(hr.weather_code[i], cx, y0 + 57, 62, !!hr.is_day[i]);
-    text(`${fmt(hr.temperature_2m[i])}°`, cx, y1 - 32, 19, true);
-    const s = `${fmt(hr.precipitation[i], u.rain === "in" ? 2 : 1)}${u.rain}  ${fmt(hr.precipitation_probability[i])}%`;
+    text(k === 0 ? "Now" : hhmm(hr.time[i]), cx, y0 + 13, 16, true);
+    const code = k === 0 ? nowCode(wx) : Math.max(...win("weather_code"));
+    const isDay = k === 0 ? wx.current.is_day : hr.is_day[Math.min(i + 1, hr.is_day.length - 1)];
+    drawIcon(code, cx, y0 + 57, 62, !!isDay);
+    text(`${fmt(k === 0 ? wx.current.temperature_2m : hr.temperature_2m[i])}°`, cx, y1 - 32, 19, true);
+    const rain = win("precipitation").reduce((a, b) => a + b, 0), prob = Math.max(0, ...win("precipitation_probability"));
+    const s = `${fmt(rain, u.rain === "in" ? 2 : 1)}${u.rain}  ${fmt(prob)}%`;
     text(s, cx, y1 - 13, fit(s, cw - 8, 13));
   }
 }
@@ -824,7 +885,9 @@ async function update() {
   let draw;
   try {
     const loc = await resolveLocation();
+    const radarP = state.demo ? Promise.resolve(null) : fetchRadar(loc.lat, loc.lon).catch(e => { console.warn("radar:", e); return null; });
     const wx = state.demo ? demoWeather(loc, state.units) : await fetchWeather(loc, state.units);
+    wx.radar = await radarP;
     state.last = wx;
     draw = () => render(wx);
     document.title = `${loc.name} ${fmt(wx.current.temperature_2m)}° · WeatherPanel`;

@@ -3,14 +3,21 @@ from __future__ import annotations
 
 import bisect
 import datetime as dt
+import io
 import math
 import random
 from dataclasses import dataclass
 
 import requests
+from PIL import Image
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+RADAR_URL = "https://api.rainviewer.com/public/weather-maps.json"
+RADAR_ZOOM = 7          # ~1 km per pixel; highest zoom RainViewer serves for free
+RADAR_HERE_PX = 1       # 3x3 px around the location (~3 km)
+RADAR_NEAR_PX = 9       # ~10 km radius
+RADAR_MAX_AGE_MIN = 40
 
 CURRENT_VARS = [
     "temperature_2m", "relative_humidity_2m", "apparent_temperature", "is_day",
@@ -56,6 +63,7 @@ class Weather:
     pressure_3h_ago: float | None
     units: dict
     fetched_at: dt.datetime     # local time of this machine
+    radar: dict | None = None   # {"here": bool, "near": bool, "time": aware datetime} from RainViewer
 
 
 def geocode(city: str) -> Location:
@@ -128,6 +136,37 @@ def parse(j: dict, loc: Location, units: str) -> Weather:
         units=UNIT_LABELS[units],
         fetched_at=dt.datetime.now(),
     )
+
+
+def fetch_radar(lat: float, lon: float) -> dict | None:
+    """Live radar (RainViewer): models often miss local showers, radar shows what is falling right now."""
+    meta = requests.get(RADAR_URL, timeout=15).json()
+    past = (meta.get("radar") or {}).get("past") or []
+    if not past:
+        return None
+    frame = past[-1]
+    when = dt.datetime.fromtimestamp(frame["time"], dt.timezone.utc)
+    if dt.datetime.now(dt.timezone.utc) - when > dt.timedelta(minutes=RADAR_MAX_AGE_MIN):
+        return None
+    n = 2 ** RADAR_ZOOM
+    xf = (lon + 180) / 360 * n
+    yf = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n
+    tx, ty = int(xf), int(yf)
+    px, py = int((xf - tx) * 256), int((yf - ty) * 256)
+    url = f"{meta['host']}{frame['path']}/256/{RADAR_ZOOM}/{tx}/{ty}/2/0_0.png"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    alpha = Image.open(io.BytesIO(r.content)).convert("RGBA").getchannel("A")
+
+    def wet_within(rad):
+        for y in range(max(0, py - rad), min(255, py + rad) + 1):
+            for x in range(max(0, px - rad), min(255, px + rad) + 1):
+                if (x - px) ** 2 + (y - py) ** 2 <= rad * rad + 1 and alpha.getpixel((x, y)) > 0:
+                    return True
+        return False
+
+    here = wet_within(RADAR_HERE_PX)
+    return {"here": here, "near": here or wet_within(RADAR_NEAR_PX), "time": when}
 
 
 def demo(loc: Location | None = None, units: str = "metric") -> Weather:

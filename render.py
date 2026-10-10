@@ -118,6 +118,17 @@ def moon_info(when: dt.datetime):
     return p, next(n for lim, n in names if p < lim)
 
 
+WET_KINDS = {"drizzle", "rain", "sleet", "snow", "thunder"}
+
+
+def now_code(wx: Weather):
+    """Current weather code, corrected by radar when the model says dry but rain is being observed."""
+    code = wx.current.get("weather_code")
+    if wx.radar and wx.radar["here"] and icons.classify(code)[0] not in WET_KINDS:
+        return 61
+    return code
+
+
 def uv_label(uv):
     if uv is None:
         return ""
@@ -179,7 +190,7 @@ def conditions_panel(img, d, wx: Weather, box):
     icons.cloud(d, x1 - 92, ty, 30, 2)
     d.text((x1 - 72, ty), f"{fmt_num(cur.get('cloud_cover'))}%", font=F(16, True), fill=INK, anchor="lm")
 
-    icons.draw_icon(img, cur.get("weather_code"), cx, y0 + 110, 142, bool(cur.get("is_day", 1)))
+    icons.draw_icon(img, now_code(wx), cx, y0 + 110, 142, bool(cur.get("is_day", 1)))
 
     hum = f"{fmt_num(cur.get('relative_humidity_2m'))}%"
     f = F(34, True)
@@ -246,14 +257,22 @@ def precip_cell(d, wx: Weather, box):
     rain, pp = wx.hourly["precipitation"][:24], wx.hourly["precipitation_probability"][:24]
     threshold = 0.004 if u["rain"] == "in" else 0.1
     nxt = next((i for i, (r, q) in enumerate(zip(rain, pp)) if (r or 0) >= threshold and (q or 0) >= 40), None)
-    msg = "Dry next 24 h" if nxt is None else "Rain now" if nxt == 0 else f"Rain expected in {nxt} h"
-    d.text((cx, y0 + 114), msg, font=F(15), fill=INK, anchor="mm")
+    radar = wx.radar
+    ago = max(0, round((dt.datetime.now(dt.timezone.utc) - radar["time"]).total_seconds() / 60)) if radar else 0
+    if radar and radar["here"]:
+        msg = f"Raining now · radar {ago} min ago"
+    elif radar and radar["near"]:
+        msg = f"Rain nearby · radar {ago} min ago"
+    else:
+        msg = "Dry next 24 h" if nxt is None else "Rain now" if nxt == 0 else f"Rain expected in {nxt} h"
+    d.text((cx, y0 + 114), msg, font=fit(d, msg, x1 - x0 - 10, 15), fill=INK, anchor="mm")
 
 
 def summary_bar(d, wx: Weather, box):
     x0, y0, x1, y1 = panel(d, box)
     cy = (y0 + y1) / 2
-    desc = icons.describe(wx.current.get("weather_code"))
+    code = wx.current.get("weather_code")
+    desc = "Rain (seen on radar)" if now_code(wx) != code else icons.describe(code)
     uv = wx.current.get("uv_index")
     right = f"UV {uv:g} {uv_label(uv)}" if uv is not None else ""
     rf = F(18, True)
@@ -285,20 +304,28 @@ def hourly_strip(img, d, wx: Weather, y0, y1, n=12, step=3):
     gap = 4
     cw = (W - 2 * M - gap * (n - 1)) / n
     for k in range(n):
-        i = 1 + k * step
+        # each cell covers `step` hours starting at the current hour: rain is summed, chance is the max
+        i = k * step
         if i >= len(hr["time"]):
             break
+
+        def win(key):
+            return [v for v in hr[key][i:i + step] if v is not None]
+
         x0 = M + k * (cw + gap)
         x1 = x0 + cw
         d.rectangle((x0, y0, x1, y1), outline=INK, width=2)
         d.line((x0, y0 + 24, x1, y0 + 24), fill=INK, width=2)
         cx = (x0 + x1) / 2
-        d.text((cx, y0 + 13), hr["time"][i].strftime("%H:%M"), font=F(16, True), fill=INK, anchor="mm")
-        icons.draw_icon(img, hr["weather_code"][i], cx, y0 + 57, 62, bool(hr["is_day"][i]))
-        d.text((cx, y1 - 32), f"{fmt_num(hr['temperature_2m'][i])}°", font=F(19, True), fill=INK, anchor="mm")
-        rain = hr["precipitation"][i]
-        rain_s = fmt_num(rain, 2 if u["rain"] == "in" else 1)
-        line = f"{rain_s}{u['rain']}  {fmt_num(hr['precipitation_probability'][i])}%"
+        label = "Now" if k == 0 else hr["time"][i].strftime("%H:%M")
+        d.text((cx, y0 + 13), label, font=F(16, True), fill=INK, anchor="mm")
+        code = now_code(wx) if k == 0 else max(win("weather_code") or [0])
+        is_day = wx.current.get("is_day", 1) if k == 0 else hr["is_day"][min(i + 1, len(hr["is_day"]) - 1)]
+        icons.draw_icon(img, code, cx, y0 + 57, 62, bool(is_day))
+        temp = wx.current.get("temperature_2m") if k == 0 else hr["temperature_2m"][i]
+        d.text((cx, y1 - 32), f"{fmt_num(temp)}°", font=F(19, True), fill=INK, anchor="mm")
+        rain_s = fmt_num(sum(win("precipitation")), 2 if u["rain"] == "in" else 1)
+        line = f"{rain_s}{u['rain']}  {fmt_num(max(win('precipitation_probability') or [0]))}%"
         d.text((cx, y1 - 13), line, font=fit(d, line, cw - 8, 13), fill=INK, anchor="mm")
 
 

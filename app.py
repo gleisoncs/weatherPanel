@@ -67,6 +67,11 @@ class Source:
         try:
             loc = self.location()
             wx = weather.demo(loc, self.args.units) if self.args.demo else weather.fetch(loc, self.args.units)
+            if not self.args.demo:
+                try:
+                    wx.radar = weather.fetch_radar(loc.lat, loc.lon)
+                except Exception as e:  # radar is a bonus; keep the forecast if it fails
+                    print(f"radar: {e}", file=sys.stderr)
             self.last = wx
             return render.render(wx)
         except Exception as e:  # network down, bad city, API error...
