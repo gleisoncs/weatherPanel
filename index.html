@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#e6e6df">
 <title>WeatherPanel</title>
 <meta name="description" content="E-paper style weather station powered by Open-Meteo">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23e6e6df'/%3E%3Cpath d='M9 23h14a5 5 0 0 0 0-10 7 7 0 0 0-13 2 4 4 0 0 0-1 8z' fill='none' stroke='%23222226' stroke-width='2.5'/%3E%3C/svg%3E">
@@ -76,6 +77,15 @@
   }
   @media (prefers-reduced-motion: reduce) { #overlay { display: none; } }
   footer { color: var(--muted); font-size: 12px; margin-top: 10px; text-align: center; }
+  /* phones: bigger touch targets, 16px text so iOS does not zoom into fields, two buttons per row */
+  @media (max-width: 699px) {
+    body { padding: 10px max(10px, env(safe-area-inset-right)) 16px max(10px, env(safe-area-inset-left)); }
+    .controls { gap: 6px; margin-bottom: 10px; }
+    .controls form { flex: 1 1 100%; }
+    .controls input, .controls select, .controls button { font-size: 16px; min-height: 44px; padding: 8px 10px; }
+    #geo, #pixel, #units, #refresh { flex: 1 1 calc(50% - 3px); min-width: 0; }
+    .hint { display: none; }
+  }
   footer a { color: inherit; }
 </style>
 </head>
@@ -92,8 +102,8 @@
       <option value="2">Pixels: medium</option>
     </select>
     <select id="units" aria-label="Units">
-      <option value="metric">Metric (°C, km/h, mm)</option>
-      <option value="imperial">Imperial (°F, mph, in)</option>
+      <option value="metric">°C · km/h · mm</option>
+      <option value="imperial">°F · mph · in</option>
     </select>
     <button id="refresh" type="button" title="Refresh now (R)">Refresh</button>
     <span class="hint">R refresh · F fullscreen</span>
@@ -108,7 +118,8 @@
 <script>
 "use strict";
 // ------------------------------------------------------------------ config
-const W = 1200, H = 825, M = 8;
+let W = 1200, H = 825;   // current layout size (desktop panel or the taller phone layout)
+const M = 8;
 // The layout is designed at 1200x825 but drawn on a smaller "screen" (default 800x550, like a 7.5" e-paper
 // panel), then enlarged with hard pixels. The "Pixels" selector (or ?pixel=1|1.5|2) picks the size;
 // 1 = normal: smooth, full-resolution drawing with no pixel effect.
@@ -345,6 +356,9 @@ function setupCanvas() {
   canvas.width = Math.round(W * scale);
   canvas.height = Math.round(H * scale);
   canvas.style.imageRendering = smooth() ? "auto" : "";
+  canvas.style.aspectRatio = `${W} / ${H}`;
+  grain = null;
+  patterns = {};
   ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
 }
@@ -674,17 +688,21 @@ function precipCell(wx, box) {
   text(val, cx - 14, y0 + 44, 44, true);
   text(`${u.rain} today`, cx - 14 + vw / 2 + 6, y0 + 52, 15, false, "l");
   text(`Chance ${fmt(wx.daily.precipitation_probability_max[0])}%`, cx, y0 + 88, 20, true);
-  const thr = u.rain === "in" ? 0.004 : 0.1;
+  const msg = rainMessage(wx);
+  text(msg, cx, y0 + 114, fit(msg, x1 - x0 - 10, 15));
+}
+
+function rainMessage(wx) {
+  const thr = wx.units.rain === "in" ? 0.004 : 0.1;
   let next = -1;
   for (let i = 0; i < 24 && i < wx.hourly.precipitation.length; i++) {
     if ((wx.hourly.precipitation[i] ?? 0) >= thr && (wx.hourly.precipitation_probability[i] ?? 0) >= 40) { next = i; break; }
   }
   const radar = wx.radar;
   const ago = radar ? Math.max(0, Math.round((Date.now() - radar.time) / 60e3)) : 0;
-  const msg = radar && radar.here ? `Raining now · radar ${ago} min ago`
+  return radar && radar.here ? `Raining now · radar ${ago} min ago`
     : radar && radar.near ? `Rain nearby · radar ${ago} min ago`
     : next < 0 ? "Dry next 24 h" : next === 0 ? "Rain now" : `Rain expected in ${next} h`;
-  text(msg, cx, y0 + 114, fit(msg, x1 - x0 - 10, 15));
 }
 
 function summaryBar(wx, box) {
@@ -714,25 +732,32 @@ function sunMoonBlock(wx, box) {
   moonPhase(x1 - 44, (y0 + y1) / 2, 30, phase, wx.location.lat < 0);
 }
 
-function hourlyStrip(wx, y0, y1, n = 12, step = 3) {
-  const hr = wx.hourly, u = wx.units, gap = 4;
-  const cw = (W - 2 * M - gap * (n - 1)) / n;
+const HOUR_DESKTOP = { bar: 24, time: 16, iconY: 57, icon: 62, temp: 19, tempY: 32, rain: 13, rainY: 13 };
+const HOUR_PHONE = { bar: 22, time: 14, iconY: 52, icon: 50, temp: 17, tempY: 30, rain: 11, rainY: 12 };
+
+// One forecast cell covering `step` hours from the current hour: rain is summed, chance is the max.
+function hourCell(wx, k, [x0, y0, x1, y1], sz, step = 3) {
+  const hr = wx.hourly, u = wx.units, i = k * step;
+  if (i >= hr.time.length) return;
+  const win = key => hr[key].slice(i, i + step).filter(v => v != null);
+  const cx = (x0 + x1) / 2;
+  strokeRect(x0, y0, x1, y1);
+  line([[x0, y0 + sz.bar], [x1, y0 + sz.bar]]);
+  text(k === 0 ? "Now" : hhmm(hr.time[i]), cx, y0 + sz.bar / 2 + 1, sz.time, true);
+  const code = k === 0 ? nowCode(wx) : Math.max(...win("weather_code"));
+  const isDay = k === 0 ? wx.current.is_day : hr.is_day[Math.min(i + 1, hr.is_day.length - 1)];
+  drawIcon(code, cx, y0 + sz.iconY, sz.icon, !!isDay);
+  text(`${fmt(k === 0 ? wx.current.temperature_2m : hr.temperature_2m[i])}°`, cx, y1 - sz.tempY, sz.temp, true);
+  const rain = win("precipitation").reduce((a, b) => a + b, 0), prob = Math.max(0, ...win("precipitation_probability"));
+  const s = `${fmt(rain, u.rain === "in" ? 2 : 1)}${u.rain}  ${fmt(prob)}%`;
+  text(s, cx, y1 - sz.rainY, fit(s, x1 - x0 - 8, sz.rain));
+}
+
+function hourlyStrip(wx, y0, y1, n = 12) {
+  const gap = 4, cw = (W - 2 * M - gap * (n - 1)) / n;
   for (let k = 0; k < n; k++) {
-    // each cell covers `step` hours starting at the current hour: rain is summed, chance is the max
-    const i = k * step;
-    if (i >= hr.time.length) break;
-    const win = key => hr[key].slice(i, i + step).filter(v => v != null);
-    const x0 = M + k * (cw + gap), x1 = x0 + cw, cx = (x0 + x1) / 2;
-    strokeRect(x0, y0, x1, y1);
-    line([[x0, y0 + 24], [x1, y0 + 24]]);
-    text(k === 0 ? "Now" : hhmm(hr.time[i]), cx, y0 + 13, 16, true);
-    const code = k === 0 ? nowCode(wx) : Math.max(...win("weather_code"));
-    const isDay = k === 0 ? wx.current.is_day : hr.is_day[Math.min(i + 1, hr.is_day.length - 1)];
-    drawIcon(code, cx, y0 + 57, 62, !!isDay);
-    text(`${fmt(k === 0 ? wx.current.temperature_2m : hr.temperature_2m[i])}°`, cx, y1 - 32, 19, true);
-    const rain = win("precipitation").reduce((a, b) => a + b, 0), prob = Math.max(0, ...win("precipitation_probability"));
-    const s = `${fmt(rain, u.rain === "in" ? 2 : 1)}${u.rain}  ${fmt(prob)}%`;
-    text(s, cx, y1 - 13, fit(s, cw - 8, 13));
+    const x0 = M + k * (cw + gap);
+    hourCell(wx, k, [x0, y0, x0 + cw, y1], HOUR_DESKTOP);
   }
 }
 
@@ -823,17 +848,23 @@ function chart(box, title, times, values, mode, fixed, decimals, avgDecimals) {
   strokeRect(px0, py0, px1, py1);
 }
 
-function charts(wx, y0, y1, hours = 72) {
+// [title, values, mode, fixed range, axis decimals, average decimals]
+function chartSpecs(wx) {
   const hr = wx.hourly, u = wx.units, inch = u.rain === "in";
-  text(`${hours / 24}-Day Forecast Values`, W / 2, y0 + 10, 19, true);
-  const times = hr.time.slice(0, hours);
-  const specs = [
+  return [
     [`Temp (°${u.temp})`, hr.temperature_2m, "line", null, null, 1],
     ["Humidity (%)", hr.relative_humidity_2m, "line", [0, 100], 0, 0],
     ["Pressure (hPa)", hr.pressure_msl, "line", null, 0, 0],
     [`Rain (${u.rain}/3h)`, hr.precipitation, "bars", inch ? 0.04 : 1, null, 2],
     ["Clouds (%)", hr.cloud_cover, "area", [0, 100], 0, 0],
   ];
+}
+
+function charts(wx, y0, y1, hours = 72) {
+  const hr = wx.hourly;
+  text(`${hours / 24}-Day Forecast Values`, W / 2, y0 + 10, 19, true);
+  const times = hr.time.slice(0, hours);
+  const specs = chartSpecs(wx);
   const cw = (W - 2 * M) / specs.length;
   specs.forEach(([title, values, mode, fixed, nd, avgNd], k) => {
     const x0 = M + k * cw;
@@ -844,6 +875,10 @@ function charts(wx, y0, y1, hours = 72) {
 function clear() { ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H); }
 
 function render(wx, status) {
+  layout === "phone" ? renderPhone(wx, status) : renderDesktop(wx, status);
+}
+
+function renderDesktop(wx, status) {
   clear();
   header(wx, status);
   windPanel(wx, [M, 44, 300, 340]);
@@ -862,9 +897,158 @@ function render(wx, status) {
 function renderMessage(title, detail = "") {
   clear();
   strokeRect(M, M, W - M, H - M);
-  drawIcon(3, W / 2, H / 2 - 120, 160);
-  text(title, W / 2, H / 2 + 10, 34, true);
-  detail.split("\n").slice(0, 6).forEach((s, k) => text(s, W / 2, H / 2 + 60 + k * 26, fit(s, W - 80, 18)));
+  const cy = Math.min(H / 2, 330);   // keep it on the first screen of the tall phone layout
+  drawIcon(3, W / 2, cy - 120, 160);
+  text(title, W / 2, cy + 10, fit(title, W - 40, 34, true), true);
+  detail.split("\n").slice(0, 6).forEach((s, k) => text(s, W / 2, cy + 60 + k * 26, fit(s, W - 40, 18)));
+}
+
+// ------------------------------------------------------------------ phone layout (portrait, scrolls)
+const PHONE_W = 480;
+const PH = { header: 40, now: 196, stat: 86, statRows: 4, msg: 40, hour: 120, hourGap: 6, dayTitle: 30, day: 46, days: 7,
+             chartTitle: 30, chart: 156, gap: 8 };
+const PHONE_H = 2 * M + PH.header + PH.now + PH.stat * PH.statRows + PH.msg + 2 * PH.hour + PH.hourGap
+  + PH.dayTitle + PH.day * PH.days + PH.chartTitle + PH.chart * 5 + 6 * PH.gap;
+
+let layout = "desktop";
+const wantPhone = () => window.matchMedia("(max-width: 699px)").matches;
+function applyLayout() {
+  layout = wantPhone() ? "phone" : "desktop";
+  [W, H] = layout === "phone" ? [PHONE_W, PHONE_H] : [1200, 825];
+}
+
+function phoneHeader(wx, status, y) {
+  strokeRect(M, y, W - M, y + PH.header);
+  const loc = wx.location, cy = y + PH.header / 2, f = wx.fetchedAt;
+  const city = loc.name.toUpperCase() + (loc.country ? `, ${loc.country}` : "");
+  const right = status || `Updated ${pad(f.getHours())}:${pad(f.getMinutes())}`;
+  text(right, W - M - 10, cy, 13, true, "r");
+  text(city, M + 10, cy, fit(city, W - 2 * M - textW(right, 13, true) - 34, 20, true), true, "l");
+}
+
+function phoneNow(wx, box) {
+  const [x0, y0, x1, y1] = panel(box);
+  const cur = wx.current, w = x1 - x0, lx = x0 + w * 0.27, rx = x0 + w * 0.77;
+  drawIcon(nowCode(wx), lx, y0 + 80, 128, !!(cur.is_day ?? 1));
+  const desc = radarOverrides(wx) ? "Rain (radar)" : WMO_TEXT[cur.weather_code] || "Unknown";
+  text(desc, lx, y1 - 24, fit(desc, w * 0.54 - 16, 18, true), true);
+  line([[x0 + w * 0.54, y0 + 16], [x0 + w * 0.54, y1 - 16]], 1);
+  const t = `${fmt(cur.temperature_2m, 1)}°`, tw = textW(t, 48, true);
+  text(t, rx - 10, y0 + 54, 48, true);
+  text(wx.units.temp, rx - 10 + tw / 2 + 4, y0 + 62, 20, false, "l");
+  text(`${fmt(wx.daily.temperature_2m_max[0])}°  |  ${fmt(wx.daily.temperature_2m_min[0])}°`, rx, y0 + 104, 20, true);
+  text(`Feels like ${fmt(cur.apparent_temperature)}°`, rx, y0 + 132, 15);
+  const n = wx.now;
+  text(`${DAYS[n.getUTCDay()].slice(0, 3)} ${pad(n.getUTCDate())}-${MONTHS[n.getUTCMonth()]}-${n.getUTCFullYear()}`, rx, y1 - 24, 15, true);
+}
+
+// Small titled cell: optional pictogram on the left, a big value and a detail line.
+function statCell(box, title, big, small, picto) {
+  const [x0, y0, x1, y1] = panel(box, title, 24);
+  const left = picto ? 50 : 0, cx = x0 + left + (x1 - x0 - left) / 2, maxW = x1 - x0 - left - 12;
+  if (picto) picto(x0 + 30, (y0 + y1) / 2);
+  text(big, cx, y0 + 22, fit(big, maxW, 24, true), true);
+  text(small, cx, y1 - 15, fit(small, maxW, 13));
+}
+
+function phoneStats(wx, y) {
+  const cur = wx.current, u = wx.units, dy = wx.daily;
+  const half = (W - 2 * M) / 2;
+  const dir = cur.wind_direction_10m;
+  const p = cur.pressure_msl, old = wx.pressure3hAgo;
+  const delta = p == null || old == null ? null : p - old;
+  const word = delta == null ? "--" : delta > 0.5 ? "Rising" : delta < -0.5 ? "Falling" : "Steady";
+  const vis = cur.visibility, uv = cur.uv_index;
+  const rise = dy.sunrise[0], set = dy.sunset[0], mins = Math.round((set - rise) / 60e3);
+  const [phase, moonName] = moonInfo(new Date());
+  const lit = Math.round((1 - Math.cos(2 * Math.PI * phase)) / 2 * 100);
+  const cells = [
+    ["Wind", `${fmt(cur.wind_speed_10m)} ${u.wind}`, `${dir == null ? "--" : compassName(dir)} ${fmt(dir)}° · gust ${fmt(cur.wind_gusts_10m)}`,
+      (x, cy) => {
+        strokeCircle(x, cy, 19, 2);
+        text("N", x, cy - 12, 9, true);
+        if (dir != null) {
+          const pt = (d, r) => { const a = d * Math.PI / 180; return [x + r * Math.sin(a), cy - r * Math.cos(a)]; };
+          polygon([pt(dir, 4), pt(dir - 22, 18), pt(dir + 22, 18)]);
+        }
+      }],
+    ["Humidity", `${fmt(cur.relative_humidity_2m)}%`, `Dew point ${fmt(cur.dew_point)}°`,
+      (x, cy) => {
+        ctx.beginPath();
+        ctx.moveTo(x, cy - 16);
+        ctx.bezierCurveTo(x + 13, cy - 2, x + 12, cy + 13, x, cy + 13);
+        ctx.bezierCurveTo(x - 12, cy + 13, x - 13, cy - 2, x, cy - 16);
+        ctx.lineWidth = 2; ctx.strokeStyle = INK; ctx.stroke();
+      }],
+    ["Pressure", `${fmt(p)} hPa`, delta == null ? word : `${word} ${delta >= 0 ? "+" : ""}${delta.toFixed(1)} / 3 h`,
+      (x, cy) => {
+        if (word === "Rising") polygon([[x, cy - 12], [x - 11, cy + 8], [x + 11, cy + 8]]);
+        else if (word === "Falling") polygon([[x, cy + 12], [x - 11, cy - 8], [x + 11, cy - 8]]);
+        else polygon([[x + 12, cy], [x - 8, cy - 11], [x - 8, cy + 11]]);
+      }],
+    ["Rain today", `${fmt(dy.precipitation_sum[0], u.rain === "in" ? 2 : 1)} ${u.rain}`, `Chance ${fmt(dy.precipitation_probability_max[0])}%`,
+      (x, cy) => drawIcon(61, x, cy, 46)],
+    ["Clouds", `${fmt(cur.cloud_cover)}%`, `Visibility ${fmt(vis, (vis ?? 0) >= 10 ? 0 : 1)} ${u.vis}`,
+      (x, cy) => cloud(x, cy + 2, 38, 2)],
+    ["UV index", uv == null ? "--" : fmtG(uv), uvLabel(uv) || "--",
+      (x, cy) => sun(x, cy, 9, 2)],
+    ["Sun", `${hhmm(rise)} - ${hhmm(set)}`, `Daylight ${Math.floor(mins / 60)}h ${pad(mins % 60)}m`,
+      (x, cy) => { sun(x, cy + 2, 7, 2); line([[x - 18, cy + 15], [x + 18, cy + 15]], 2); }],
+    ["Moon", moonName, `${lit}% lit`,
+      (x, cy) => moonPhase(x, cy, 18, phase, wx.location.lat < 0)],
+  ];
+  cells.forEach(([title, big, small, picto], k) => {
+    const x0 = M + (k % 2) * half, y0 = y + Math.floor(k / 2) * PH.stat;
+    statCell([x0, y0, x0 + half, y0 + PH.stat], title, big, small, picto);
+  });
+}
+
+function phoneDaily(wx, y) {
+  const dy = wx.daily, u = wx.units, n = Math.min(PH.days, dy.time.length);
+  text("7-Day Forecast", W / 2, y + PH.dayTitle / 2, 18, true);
+  y += PH.dayTitle;
+  strokeRect(M, y, W - M, y + PH.day * PH.days);
+  for (let k = 0; k < n; k++) {
+    const ry = y + k * PH.day, cy = ry + PH.day / 2;
+    if (k > 0) line([[M + 8, ry], [W - M - 8, ry]], 1);
+    const label = k === 0 ? "Today" : k === 1 ? "Tomorrow" : DAYS[dy.time[k].getUTCDay()];
+    text(label, M + 12, cy, 16, true, "l");
+    drawIcon(dy.weather_code[k], M + 150, cy, 42, true);
+    text(`${fmt(dy.temperature_2m_max[k])}° / ${fmt(dy.temperature_2m_min[k])}°`, M + 190, cy, 18, true, "l");
+    const rain = `${fmt(dy.precipitation_sum[k], u.rain === "in" ? 2 : 1)} ${u.rain} · ${fmt(dy.precipitation_probability_max[k])}%`;
+    text(rain, W - M - 12, cy, fit(rain, 120, 14), false, "r");
+  }
+}
+
+function renderPhone(wx, status) {
+  clear();
+  let y = M;
+  phoneHeader(wx, status, y);
+  y += PH.header + PH.gap;
+  phoneNow(wx, [M, y, W - M, y + PH.now]);
+  y += PH.now + PH.gap;
+  phoneStats(wx, y);
+  y += PH.stat * PH.statRows + PH.gap;
+  const [mx0, my0, mx1, my1] = panel([M, y, W - M, y + PH.msg]);
+  const msg = rainMessage(wx);
+  text(msg, (mx0 + mx1) / 2, (my0 + my1) / 2, fit(msg, mx1 - mx0 - 20, 17, true), true);
+  y += PH.msg + PH.gap;
+  // hourly: two rows of six 3-hour cells (36 h)
+  const gap = 4, cw = (W - 2 * M - gap * 5) / 6;
+  for (let k = 0; k < 12; k++) {
+    const x0 = M + (k % 6) * (cw + gap), y0 = y + Math.floor(k / 6) * (PH.hour + PH.hourGap);
+    hourCell(wx, k, [x0, y0, x0 + cw, y0 + PH.hour], HOUR_PHONE);
+  }
+  y += 2 * PH.hour + PH.hourGap + PH.gap;
+  phoneDaily(wx, y);
+  y += PH.dayTitle + PH.day * PH.days + PH.gap;
+  text("3-Day Forecast Values", W / 2, y + PH.chartTitle / 2, 18, true);
+  y += PH.chartTitle;
+  const times = wx.hourly.time.slice(0, 72);
+  chartSpecs(wx).forEach(([title, values, mode, fixed, nd, avgNd], k) => {
+    const cy0 = y + k * PH.chart;
+    chart([M, cy0, W - M, cy0 + PH.chart - 6], title, times, values.slice(0, 72), mode, fixed, nd, avgNd);
+  });
 }
 
 // ------------------------------------------------------------------ app
@@ -973,8 +1157,6 @@ $pixel.addEventListener("change", () => {
   PIXEL = nearestPixel(+$pixel.value);
   store.set("wp.pixel", String(PIXEL));
   syncUrl();
-  grain = null;
-  patterns = {};
   swap(() => { setupCanvas(); state.lastDraw(); });
 });
 $units.addEventListener("change", () => {
@@ -1004,6 +1186,14 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.last && Date.now() - state.last.fetchedAt > state.refreshMin * 60e3) update();
 });
 
+window.addEventListener("resize", () => {
+  // switch between the desktop panel and the phone layout (e.g. on rotation) and redraw without refetching
+  const was = layout;
+  applyLayout();
+  if (layout !== was) { setupCanvas(); state.lastDraw(); epaper(); }
+});
+
+applyLayout();
 setupCanvas();
 state.lastDraw = () => renderMessage("Loading...", "Fetching weather from Open-Meteo");
 state.lastDraw();
