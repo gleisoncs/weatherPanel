@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeatherPanel</title>
+<meta name="description" content="E-paper style weather station powered by Open-Meteo">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23e6e6df'/%3E%3Cpath d='M9 23h14a5 5 0 0 0 0-10 7 7 0 0 0-13 2 4 4 0 0 0-1 8z' fill='none' stroke='%23222226' stroke-width='2.5'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --page: #cfccc3;
+    --bezel: #ecebe5;
+    --bezel-edge: #bdbab1;
+    --text: #2a2a2e;
+    --muted: #5d5c58;
+    --field: #f7f6f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --page: #1d1d1f; --text: #e6e5e0; --muted: #a09f9a; --field: #2a2a2d; }
+  }
+  :root[data-theme="dark"] { --page: #1d1d1f; --text: #e6e5e0; --muted: #a09f9a; --field: #2a2a2d; }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--page);
+    color: var(--text);
+    font: 14px/1.4 Arial, "Helvetica Neue", Helvetica, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+  }
+  .controls {
+    width: 100%;
+    max-width: 1252px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .controls form { display: flex; gap: 8px; flex: 1 1 260px; }
+  .controls input, .controls select, .controls button {
+    font: inherit;
+    color: var(--text);
+    background: var(--field);
+    border: 1px solid var(--bezel-edge);
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+  .controls input { flex: 1; min-width: 0; }
+  .controls button { cursor: pointer; font-weight: bold; }
+  .controls button:hover { filter: brightness(0.96); }
+  .hint { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .device {
+    width: 100%;
+    max-width: 1252px;
+    background: var(--bezel);
+    border: 2px solid var(--bezel-edge);
+    border-radius: 10px;
+    padding: clamp(8px, 2.2vw, 26px);
+    box-shadow: 0 10px 30px rgba(0,0,0,.25), inset 0 0 0 1px #fff8;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1200 / 825;
+    background: #e6e6df;
+    transition: none;
+  }
+  canvas.flash-invert { filter: invert(1); }
+  canvas.flash-black { filter: brightness(0); }
+  canvas.flash-white { filter: brightness(0) invert(1); }
+  footer { color: var(--muted); font-size: 12px; margin-top: 10px; text-align: center; }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+  <div class="controls">
+    <form id="cityForm">
+      <input id="city" type="search" placeholder="City (e.g. Berlin)" aria-label="City" autocomplete="off">
+      <button type="submit">Go</button>
+    </form>
+    <button id="geo" type="button" title="Use my location">My location</button>
+    <select id="units" aria-label="Units">
+      <option value="metric">Metric (°C, km/h, mm)</option>
+      <option value="imperial">Imperial (°F, mph, in)</option>
+    </select>
+    <button id="refresh" type="button" title="Refresh now (R)">Refresh</button>
+    <span class="hint">R refresh · F fullscreen</span>
+  </div>
+
+  <div class="device" id="device">
+    <canvas id="panel" width="1200" height="825" role="img" aria-label="Weather panel"></canvas>
+  </div>
+  <footer>Weather data by <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a> · auto-refresh every <span id="every">15</span> min</footer>
+
+<script>
+"use strict";
+// ------------------------------------------------------------------ config
+const W = 1200, H = 825, M = 8;
+const INK = "#222226", PAPER = "#e6e6df";
+const GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search";
+const FORECAST_URL = "https://api.open-meteo.com/v1/forecast";
+const CURRENT_VARS = ["temperature_2m","relative_humidity_2m","apparent_temperature","is_day","precipitation",
+  "weather_code","cloud_cover","pressure_msl","wind_speed_10m","wind_direction_10m","wind_gusts_10m"];
+const HOURLY_VARS = ["temperature_2m","relative_humidity_2m","dew_point_2m","precipitation","precipitation_probability",
+  "weather_code","cloud_cover","pressure_msl","visibility","wind_speed_10m","is_day","uv_index"];
+const DAILY_VARS = ["weather_code","temperature_2m_max","temperature_2m_min","precipitation_sum",
+  "precipitation_probability_max","sunrise","sunset","uv_index_max","wind_speed_10m_max"];
+const UNIT_PARAMS = {
+  metric: { temperature_unit: "celsius", wind_speed_unit: "kmh", precipitation_unit: "mm" },
+  imperial: { temperature_unit: "fahrenheit", wind_speed_unit: "mph", precipitation_unit: "inch" },
+};
+const UNIT_LABELS = {
+  metric: { temp: "C", wind: "km/h", rain: "mm", vis: "km" },
+  imperial: { temp: "F", wind: "mph", rain: "in", vis: "mi" },
+};
+const WMO_TEXT = {
+  0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Depositing rime fog",
+  51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle", 56: "Light freezing drizzle", 57: "Freezing drizzle",
+  61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Light freezing rain", 67: "Freezing rain",
+  71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow grains",
+  80: "Light rain showers", 81: "Rain showers", 82: "Violent rain showers", 85: "Snow showers", 86: "Heavy snow showers",
+  95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with heavy hail",
+};
+const COMPASS16 = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+// ------------------------------------------------------------------ storage (per-viewer convenience only)
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } },
+};
+
+// ------------------------------------------------------------------ time helpers
+// Open-Meteo returns local wall-clock strings for the location; keep them as UTC dates so the
+// browser's own time zone never shifts them.
+function parseLocal(s) {
+  const [d, t = "00:00"] = s.split("T");
+  const [y, mo, da] = d.split("-").map(Number);
+  const [h, mi] = t.split(":").map(Number);
+  return new Date(Date.UTC(y, mo - 1, da, h, mi));
+}
+const pad = n => String(n).padStart(2, "0");
+const hhmm = d => `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+const sameDay = (a, b) => a.getUTCFullYear() === b.getUTCFullYear() && a.getUTCMonth() === b.getUTCMonth() && a.getUTCDate() === b.getUTCDate();
+
+// ------------------------------------------------------------------ data
+async function geocode(city) {
+  const r = await fetch(`${GEOCODE_URL}?${new URLSearchParams({ name: city, count: 1, format: "json" })}`);
+  if (!r.ok) throw new Error(`Geocoding failed (${r.status})`);
+  const res = (await r.json()).results;
+  if (!res || !res.length) throw new Error(`City not found: "${city}"`);
+  const g = res[0];
+  return { name: g.name, lat: g.latitude, lon: g.longitude, country: g.country_code || "" };
+}
+
+async function fetchWeather(loc, units) {
+  const params = new URLSearchParams({
+    latitude: loc.lat, longitude: loc.lon, timezone: "auto", past_days: 1, forecast_days: 7,
+    current: CURRENT_VARS.join(","), hourly: HOURLY_VARS.join(","), daily: DAILY_VARS.join(","),
+    ...UNIT_PARAMS[units],
+  });
+  const r = await fetch(`${FORECAST_URL}?${params}`);
+  if (!r.ok) {
+    let reason = r.statusText;
+    try { reason = (await r.json()).reason || reason; } catch { /* ignore */ }
+    throw new Error(`Open-Meteo error ${r.status}: ${reason}`);
+  }
+  return parseWeather(await r.json(), loc, units);
+}
+
+function parseWeather(j, loc, units) {
+  const cur = { ...j.current };
+  const now = parseLocal(cur.time);
+  const h = j.hourly;
+  const times = h.time.map(parseLocal);
+  let i0 = 0;
+  while (i0 + 1 < times.length && times[i0 + 1] <= now) i0++;
+  const hourly = {};
+  for (const k of Object.keys(h)) if (k !== "time") hourly[k] = h[k].slice(i0);
+  hourly.time = times.slice(i0);
+
+  let vis = h.visibility[i0];
+  if (vis != null) {
+    if ((j.hourly_units || {}).visibility === "ft") vis = units === "imperial" ? vis / 5280 : vis * 0.0003048;
+    else vis = units === "imperial" ? vis / 1609.34 : vis / 1000;
+  }
+  cur.visibility = vis;
+  cur.dew_point = h.dew_point_2m[i0];
+  cur.uv_index = h.uv_index[i0];
+
+  const d = j.daily;
+  const days = d.time.map(parseLocal);
+  let di = days.findIndex(x => sameDay(x, now));
+  if (di < 0) di = 0;
+  const daily = {};
+  for (const k of Object.keys(d)) if (k !== "time") daily[k] = d[k].slice(di);
+  daily.time = days.slice(di);
+  daily.sunrise = daily.sunrise.map(parseLocal);
+  daily.sunset = daily.sunset.map(parseLocal);
+
+  return {
+    location: loc, now, current: cur, hourly, daily,
+    pressure3hAgo: i0 >= 3 ? h.pressure_msl[i0 - 3] : null,
+    units: UNIT_LABELS[units], fetchedAt: new Date(),
+  };
+}
+
+function demoWeather(loc, units) {
+  let seed = 7;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const t0 = new Date();
+  const now = new Date(Date.UTC(t0.getFullYear(), t0.getMonth(), t0.getDate(), t0.getHours(), t0.getMinutes()));
+  const start = new Date(now); start.setUTCMinutes(0);
+  const n = 24 * 7, hr = { time: [] };
+  HOURLY_VARS.forEach(k => hr[k] = []);
+  for (let i = 0; i < n; i++) {
+    const t = new Date(start.getTime() + i * 3600e3), hh = t.getUTCHours();
+    const cc = Math.max(0, Math.min(100, 55 + 45 * Math.sin(2 * Math.PI * (i + 4) / 31) + (rnd() - .5) * 20));
+    const rr = cc > 80 ? Math.max(0, .6 + (rnd() - .5) * 3) : 0;
+    const tt = 12 + 6 * Math.sin(2 * Math.PI * (hh - 9) / 24) + 3 * Math.sin(2 * Math.PI * i / 90);
+    const hu = Math.max(30, Math.min(100, 72 - 18 * Math.sin(2 * Math.PI * (hh - 9) / 24) + cc / 8));
+    hr.time.push(t);
+    hr.temperature_2m.push(+tt.toFixed(1));
+    hr.relative_humidity_2m.push(Math.round(hu));
+    hr.dew_point_2m.push(+(tt - (100 - hu) / 5).toFixed(1));
+    hr.precipitation.push(+rr.toFixed(1));
+    hr.precipitation_probability.push(Math.round(cc > 60 ? cc * .9 : cc / 4));
+    hr.weather_code.push(rr > 2 ? 63 : rr > .3 ? 61 : rr > 0 ? 51 : cc > 85 ? 3 : cc > 45 ? 2 : cc > 15 ? 1 : 0);
+    hr.cloud_cover.push(Math.round(cc));
+    hr.pressure_msl.push(+(1014 + 9 * Math.sin(2 * Math.PI * (i + 10) / 70)).toFixed(1));
+    hr.visibility.push(10000);
+    hr.wind_speed_10m.push(+(12 + 8 * Math.sin(2 * Math.PI * i / 40)).toFixed(1));
+    const day = hh >= 7 && hh < 19 ? 1 : 0;
+    hr.is_day.push(day);
+    hr.uv_index.push(day ? +(Math.max(0, 5 * Math.sin(Math.PI * (hh - 7) / 12)) * (1 - cc / 150)).toFixed(1) : 0);
+  }
+  const dl = { time: [] };
+  DAILY_VARS.forEach(k => dl[k] = []);
+  for (let k = 0; k < 7; k++) {
+    const a = Math.max(0, k * 24 - start.getUTCHours()), b = (k + 1) * 24 - start.getUTCHours();
+    const sl = key => hr[key].slice(a, b);
+    const day = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate() + k));
+    dl.time.push(day);
+    dl.weather_code.push(Math.max(...sl("weather_code")));
+    dl.temperature_2m_max.push(Math.max(...sl("temperature_2m")));
+    dl.temperature_2m_min.push(Math.min(...sl("temperature_2m")));
+    dl.precipitation_sum.push(+sl("precipitation").reduce((x, y) => x + y, 0).toFixed(1));
+    dl.precipitation_probability_max.push(Math.max(...sl("precipitation_probability")));
+    dl.sunrise.push(new Date(day.getTime() + (7 * 60 + 12) * 60e3));
+    dl.sunset.push(new Date(day.getTime() + (18 * 60 + 41) * 60e3));
+    dl.uv_index_max.push(Math.max(...sl("uv_index")));
+    dl.wind_speed_10m_max.push(Math.max(...sl("wind_speed_10m")));
+  }
+  const cur = {
+    temperature_2m: hr.temperature_2m[0], relative_humidity_2m: hr.relative_humidity_2m[0],
+    apparent_temperature: +(hr.temperature_2m[0] - 1.8).toFixed(1), is_day: hr.is_day[0], precipitation: hr.precipitation[0],
+    weather_code: hr.weather_code[0], cloud_cover: hr.cloud_cover[0], pressure_msl: hr.pressure_msl[0],
+    wind_speed_10m: hr.wind_speed_10m[0], wind_direction_10m: 215, wind_gusts_10m: Math.round(hr.wind_speed_10m[0] * 1.7),
+    visibility: 10, dew_point: hr.dew_point_2m[0], uv_index: hr.uv_index[0],
+  };
+  return { location: loc, now, current: cur, hourly: hr, daily: dl, pressure3hAgo: hr.pressure_msl[0] - 1.4,
+           units: UNIT_LABELS[units], fetchedAt: new Date() };
+}
+
+// ------------------------------------------------------------------ drawing primitives
+const canvas = document.getElementById("panel");
+let ctx;
+
+function setupCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+const font = (size, bold) => `${bold ? "bold " : ""}${size}px Arial, "Helvetica Neue", Helvetica, "Liberation Sans", sans-serif`;
+
+function text(s, x, y, size, bold = false, align = "c", color = INK) {
+  ctx.font = font(size, bold);
+  ctx.textAlign = align === "l" ? "left" : align === "r" ? "right" : "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.fillText(s, x, y);
+}
+function textW(s, size, bold = false) { ctx.font = font(size, bold); return ctx.measureText(s).width; }
+function fit(s, maxW, size, bold = false, min = 9) { while (size > min && textW(s, size, bold) > maxW) size--; return size; }
+
+function strokeRect(x0, y0, x1, y1, lw = 2) {
+  ctx.lineWidth = lw; ctx.strokeStyle = INK;
+  ctx.strokeRect(x0 + lw / 2, y0 + lw / 2, x1 - x0 - lw, y1 - y0 - lw);
+}
+function line(pts, lw = 2, color = INK, dash = null) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.lineWidth = lw; ctx.strokeStyle = color; ctx.lineJoin = "round"; ctx.lineCap = "butt";
+  ctx.setLineDash(dash || []);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+function circlePath(cx, cy, r) { ctx.beginPath(); ctx.arc(cx, cy, Math.max(r, 0.1), 0, Math.PI * 2); }
+function fillCircle(cx, cy, r, color) { circlePath(cx, cy, r); ctx.fillStyle = color; ctx.fill(); }
+function strokeCircle(cx, cy, r, lw) { circlePath(cx, cy, r); ctx.lineWidth = lw; ctx.strokeStyle = INK; ctx.stroke(); }
+function roundRectPath(x0, y0, x1, y1, r) {
+  r = Math.min(r, (x1 - x0) / 2, (y1 - y0) / 2);
+  ctx.beginPath();
+  ctx.moveTo(x0 + r, y0);
+  ctx.arcTo(x1, y0, x1, y1, r); ctx.arcTo(x1, y1, x0, y1, r);
+  ctx.arcTo(x0, y1, x0, y0, r); ctx.arcTo(x0, y0, x1, y0, r);
+  ctx.closePath();
+}
+function polygon(pts, color = INK) {
+  ctx.beginPath(); ctx.moveTo(...pts[0]); pts.slice(1).forEach(p => ctx.lineTo(...p)); ctx.closePath();
+  ctx.fillStyle = color; ctx.fill();
+}
+
+const patterns = {};
+function pattern(density) {
+  if (!patterns[density]) {
+    const c = document.createElement("canvas");
+    c.width = 2; c.height = 2;
+    const p = c.getContext("2d");
+    p.fillStyle = PAPER; p.fillRect(0, 0, 2, 2);
+    p.fillStyle = INK; p.fillRect(0, 0, 1, 1);
+    if (density === 2) p.fillRect(1, 1, 1, 1);
+    patterns[density] = ctx.createPattern(c, "repeat");
+  }
+  return patterns[density];
+}
+function hatch(pts, density = 2) {
+  ctx.beginPath(); ctx.moveTo(...pts[0]); pts.slice(1).forEach(p => ctx.lineTo(...p)); ctx.closePath();
+  ctx.fillStyle = pattern(density); ctx.fill();
+}
+
+function panel(box, title, th = 28) {
+  const [x0, y0, x1, y1] = box;
+  strokeRect(x0, y0, x1, y1);
+  if (!title) return box;
+  line([[x0, y0 + th], [x1, y0 + th]]);
+  text(title, (x0 + x1) / 2, y0 + th / 2 + 1, 17, true);
+  return [x0, y0 + th, x1, y1];
+}
+
+const fmt = (v, nd = 0) => v == null || Number.isNaN(v) ? "--" : Number(v).toFixed(nd);
+const fmtG = v => v == null ? "--" : String(+Number(v).toFixed(1));
+
+// ------------------------------------------------------------------ icons
+function classify(code) {
+  const c = code ?? 0;
+  if (c === 0) return ["clear", 1, false];
+  if (c === 1) return ["mostly_clear", 1, false];
+  if (c === 2) return ["partly", 1, false];
+  if (c === 3) return ["overcast", 1, false];
+  if (c === 45 || c === 48) return ["fog", 1, false];
+  if ([51, 53, 55].includes(c)) return ["drizzle", [51, 53, 55].indexOf(c) + 1, false];
+  if ([56, 57, 66, 67].includes(c)) return ["sleet", 2, false];
+  if ([61, 63, 65].includes(c)) return ["rain", [61, 63, 65].indexOf(c) + 1, false];
+  if ([71, 73, 75, 77].includes(c)) return ["snow", Math.min([71, 73, 75, 77].indexOf(c) + 1, 3), false];
+  if ([80, 81, 82].includes(c)) return ["rain", [80, 81, 82].indexOf(c) + 1, true];
+  if ([85, 86].includes(c)) return ["snow", [85, 86].indexOf(c) + 2, true];
+  if (c >= 95) return ["thunder", 3, false];
+  return ["overcast", 1, false];
+}
+
+function sun(cx, cy, r, lw) {
+  fillCircle(cx, cy, r, PAPER); strokeCircle(cx, cy, r - lw / 2, lw);
+  for (let k = 0; k < 8; k++) {
+    const a = k * Math.PI / 4, ca = Math.cos(a), sa = Math.sin(a);
+    line([[cx + ca * r * 1.4, cy + sa * r * 1.4], [cx + ca * r * 1.85, cy + sa * r * 1.85]], lw);
+  }
+}
+
+function moon(cx, cy, r) {
+  ctx.save();
+  circlePath(cx, cy, r); ctx.clip();
+  ctx.fillStyle = INK; ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+  fillCircle(cx + r * 0.55, cy - r * 0.35, r * 0.85, PAPER);
+  ctx.restore();
+}
+
+const CLOUD = [["c", -0.22, 0.05, 0.19], ["c", 0.06, -0.03, 0.25], ["c", 0.30, 0.09, 0.16], ["r", -0.48, 0.03, 0.48, 0.27, 0.12]];
+function cloud(cx, cy, w, lw, fill = PAPER) {
+  for (const [grow, color] of [[lw, INK], [0, fill]]) {
+    for (const s of CLOUD) {
+      if (s[0] === "c") fillCircle(cx + s[1] * w, cy + s[2] * w, s[3] * w + grow, color);
+      else {
+        roundRectPath(cx + s[1] * w - grow, cy + s[2] * w - grow, cx + s[3] * w + grow, cy + s[4] * w + grow, s[5] * w + grow);
+        ctx.fillStyle = color; ctx.fill();
+      }
+    }
+  }
+}
+
+function flake(x, y, f, lw) {
+  for (let k = 0; k < 3; k++) {
+    const a = k * Math.PI / 3 + Math.PI / 2;
+    line([[x - Math.cos(a) * f, y - Math.sin(a) * f], [x + Math.cos(a) * f, y + Math.sin(a) * f]], lw);
+  }
+}
+
+function precip(kind, intensity, cx, cy, s, lw) {
+  const n = kind !== "drizzle" ? 2 + intensity : 3;
+  const gap = s * 0.16;
+  for (let k = 0; k < n; k++) {
+    const x = cx + (k - (n - 1) / 2) * gap;
+    const y0 = cy + s * 0.17 + (k % 2) * s * 0.07;
+    if (kind === "rain" || kind === "thunder" || (kind === "sleet" && k % 2 === 0)) {
+      if (kind === "thunder" && Math.abs(x - cx) < gap * 0.6) continue;
+      line([[x + s * 0.04, y0], [x - s * 0.03, y0 + s * 0.15]], lw);
+    } else if (kind === "drizzle") {
+      for (let j = 0; j < Math.max(1, intensity); j++) fillCircle(x, y0 + j * s * 0.09 + s * 0.03, Math.max(1.5, lw * 0.9), INK);
+    } else {
+      flake(x, y0 + s * 0.07, s * 0.055, Math.max(1, lw - 1));
+    }
+  }
+  if (kind === "thunder") {
+    const pts = [[0.05, 0.02], [-0.07, 0.22], [0, 0.22], [-0.05, 0.42], [0.11, 0.16], [0.03, 0.16], [0.10, 0.02]];
+    polygon(pts.map(([x, y]) => [cx + x * s, cy + y * s]));
+  }
+}
+
+function drawIcon(code, cx, cy, s, isDay = true) {
+  const lw = Math.max(2, Math.round(s / 28));
+  const [kind, intensity, shower] = classify(code);
+  if (kind === "clear") {
+    isDay ? sun(cx, cy, s * 0.2, lw) : moon(cx, cy, s * 0.28);
+  } else if (kind === "mostly_clear" || kind === "partly") {
+    isDay ? sun(cx - s * 0.12, cy - s * 0.12, s * 0.15, lw) : moon(cx - s * 0.12, cy - s * 0.14, s * 0.2);
+    cloud(cx + s * 0.1, cy + s * 0.14, s * (kind === "mostly_clear" ? 0.5 : 0.68), lw);
+  } else if (kind === "overcast") {
+    cloud(cx + s * 0.14, cy - s * 0.1, s * 0.52, lw);
+    cloud(cx - s * 0.06, cy + s * 0.08, s * 0.74, lw);
+  } else if (kind === "fog") {
+    cloud(cx, cy - s * 0.14, s * 0.7, lw);
+    [0.16, 0.26, 0.36].forEach((y, k) => {
+      const off = s * (k % 2 ? 0.06 : -0.04);
+      line([[cx - s * 0.32 + off, cy + y * s], [cx + s * 0.28 + off, cy + y * s]], lw);
+    });
+  } else {
+    if (shower) isDay ? sun(cx - s * 0.2, cy - s * 0.24, s * 0.12, lw) : moon(cx - s * 0.2, cy - s * 0.24, s * 0.15);
+    cloud(cx, cy - s * 0.12, s * 0.78, lw);
+    precip(kind, intensity, cx, cy, s, lw);
+  }
+}
+
+function eye(x, cy, w = 22) {
+  const h = w * 0.55;
+  ctx.beginPath(); ctx.ellipse(x + w / 2, cy, w / 2 - 1, h / 2 - 1, 0, 0, Math.PI * 2);
+  ctx.lineWidth = 2; ctx.strokeStyle = INK; ctx.stroke();
+  fillCircle(x + w / 2, cy, w * 0.18, INK);
+}
+
+function moonPhase(cx, cy, r, phase, south) {
+  fillCircle(cx, cy, r, INK);
+  const c = Math.cos(2 * Math.PI * phase);
+  ctx.fillStyle = PAPER;
+  for (let yy = -r; yy <= r; yy++) {
+    const hw = Math.sqrt(Math.max(r * r - yy * yy, 0));
+    let [xa, xb] = phase <= 0.5 ? [hw * c, hw] : [-hw, -hw * c];
+    if (south) [xa, xb] = [-xb, -xa];
+    if (xb > xa) ctx.fillRect(cx + xa, cy + yy - 0.5, xb - xa, 1);
+  }
+  strokeCircle(cx, cy, r, 2);
+}
+
+// ------------------------------------------------------------------ helpers
+function niceTicks(lo, hi, n = 4) {
+  if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+  const raw = (hi - lo) / n, mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map(s => s * mag).find(s => s >= raw);
+  const ticks = [];
+  for (let v = Math.floor(lo / step) * step; v <= Math.ceil(hi / step) * step + step * 1e-6; v += step) ticks.push(+v.toFixed(6));
+  return [ticks, step];
+}
+function decimalsFor(step) {
+  for (let k = 0; k < 4; k++) { const x = step * 10 ** k; if (Math.abs(x - Math.round(x)) < 1e-6) return k; }
+  return 3;
+}
+const compassName = deg => COMPASS16[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
+function moonInfo(when) {
+  const ref = Date.UTC(2000, 0, 6, 18, 14);
+  const syn = 29.530588853;
+  const p = ((((when.getTime() - ref) / 86400e3) % syn) + syn) % syn / syn;
+  const names = [[0.0339, "New Moon"], [0.216, "Waxing Crescent"], [0.284, "First Quarter"], [0.466, "Waxing Gibbous"],
+    [0.534, "Full Moon"], [0.716, "Waning Gibbous"], [0.784, "Last Quarter"], [0.966, "Waning Crescent"], [1.01, "New Moon"]];
+  return [p, names.find(([lim]) => p < lim)[1]];
+}
+const uvLabel = uv => uv == null ? "" : uv < 3 ? "Low" : uv < 6 ? "Moderate" : uv < 8 ? "High" : uv < 11 ? "Very high" : "Extreme";
+const mean = arr => { const v = arr.filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+
+// ------------------------------------------------------------------ sections
+function header(wx, status) {
+  strokeRect(M, M, W - M, 44);
+  const loc = wx.location;
+  const city = loc.name.toUpperCase() + (loc.country ? `, ${loc.country}` : "");
+  text(city, W / 2, 27, fit(city, 600, 22, true), true);
+  text("[Open-Meteo]", M + 10, 27, 14, true, "l");
+  const coords = `${Math.abs(loc.lat).toFixed(2)}°${loc.lat >= 0 ? "N" : "S"}  ${Math.abs(loc.lon).toFixed(2)}°${loc.lon >= 0 ? "E" : "W"}`;
+  text(status || coords, W - M - 10, 27, 14, true, "r");
+}
+
+function windPanel(wx, box) {
+  const [x0, y0, x1, y1] = panel(box, "Wind Speed/Direction");
+  const cur = wx.current, u = wx.units;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2 + 2, R = 100;
+  const pt = (deg, r) => { const a = deg * Math.PI / 180; return [cx + r * Math.sin(a), cy - r * Math.cos(a)]; };
+  strokeCircle(cx, cy, R - 1.5, 3);
+  strokeCircle(cx, cy, R * 0.74, 1);
+  for (let deg = 0; deg < 360; deg += 10) {
+    const big = deg % 90 === 0, mid = deg % 45 === 0;
+    line([pt(deg, R - (big ? 14 : mid ? 9 : 5)), pt(deg, R)], mid ? 2 : 1);
+  }
+  ["N", "NE", "E", "SE", "S", "SW", "W", "NW"].forEach((lab, k) => text(lab, ...pt(k * 45, R + 17), k % 2 ? 14 : 16, true));
+  const dir = cur.wind_direction_10m;
+  if (dir != null) {
+    polygon([pt(dir, R * 0.76), pt(dir - 8, R * 0.99), pt(dir + 8, R * 0.99)]);
+    text(compassName(dir), cx, cy - 42, 18, true);
+  }
+  text(fmt(cur.wind_speed_10m), cx, cy - 4, 46, true);
+  text(u.wind, cx, cy + 28, 16);
+  text(`${fmt(dir)}°  gust ${fmt(cur.wind_gusts_10m)}`, cx, cy + 50, 14);
+}
+
+function conditionsPanel(wx, box) {
+  const [x0, y0, x1, y1] = panel(box, "Conditions");
+  const cur = wx.current, u = wx.units, cx = (x0 + x1) / 2, ty = y0 + 20;
+  eye(x0 + 14, ty);
+  const vis = cur.visibility;
+  text(`${fmt(vis, (vis ?? 0) >= 10 ? 0 : 1)} ${u.vis}`, x0 + 42, ty, 16, true, "l");
+  cloud(x1 - 92, ty, 30, 2);
+  text(`${fmt(cur.cloud_cover)}%`, x1 - 72, ty, 16, true, "l");
+  drawIcon(cur.weather_code, cx, y0 + 110, 142, !!(cur.is_day ?? 1));
+  const hum = `${fmt(cur.relative_humidity_2m)}%`;
+  const hw = textW(hum, 34, true);
+  text(hum, cx - 12, y1 - 50, 34, true);
+  text("RH", cx - 12 + hw / 2 + 8, y1 - 46, 16, true, "l");
+  text(`Dew point ${fmt(cur.dew_point)}°`, cx, y1 - 18, 14);
+}
+
+function temperatureCell(wx, box) {
+  const [x0, y0, x1] = panel(box, "Temperature");
+  const cur = wx.current, cx = (x0 + x1) / 2;
+  const t = `${fmt(cur.temperature_2m, 1)}°`, tw = textW(t, 52, true);
+  text(t, cx - 10, y0 + 44, 52, true);
+  text(wx.units.temp, cx - 10 + tw / 2 + 6, y0 + 52, 22, false, "l");
+  text(`${fmt(wx.daily.temperature_2m_max[0])}°  |  ${fmt(wx.daily.temperature_2m_min[0])}°`, cx, y0 + 88, 20, true);
+  text(`Feels like ${fmt(cur.apparent_temperature)}°`, cx, y0 + 114, 15);
+}
+
+function pressureCell(wx, box) {
+  const [x0, y0, x1] = panel(box, "Pressure");
+  const cx = (x0 + x1) / 2, p = wx.current.pressure_msl, old = wx.pressure3hAgo;
+  text(fmt(p), cx - 18, y0 + 44, 48, true);
+  text("hPa", x1 - 12, y0 + 52, 16, false, "r");
+  const delta = p == null || old == null ? null : p - old;
+  const word = delta == null ? "--" : delta > 0.5 ? "Rising" : delta < -0.5 ? "Falling" : "Steady";
+  const tx = cx + 10, ay = y0 + 88;
+  text(word, tx, ay, 20, true);
+  const ax = tx - textW(word, 20, true) / 2 - 16;
+  if (word === "Rising") polygon([[ax, ay - 8], [ax - 7, ay + 5], [ax + 7, ay + 5]]);
+  else if (word === "Falling") polygon([[ax, ay + 8], [ax - 7, ay - 5], [ax + 7, ay - 5]]);
+  else if (word === "Steady") polygon([[ax + 8, ay], [ax - 5, ay - 7], [ax - 5, ay + 7]]);
+  if (delta != null) text(`${delta >= 0 ? "+" : ""}${delta.toFixed(1)} hPa in 3 h`, cx, y0 + 114, 15);
+}
+
+function precipCell(wx, box) {
+  const [x0, y0, x1] = panel(box, "Precipitation");
+  const cx = (x0 + x1) / 2, u = wx.units, nd = u.rain === "in" ? 2 : 1;
+  const val = fmt(wx.daily.precipitation_sum[0], nd), vw = textW(val, 44, true);
+  text(val, cx - 14, y0 + 44, 44, true);
+  text(`${u.rain} today`, cx - 14 + vw / 2 + 6, y0 + 52, 15, false, "l");
+  text(`Chance ${fmt(wx.daily.precipitation_probability_max[0])}%`, cx, y0 + 88, 20, true);
+  const thr = u.rain === "in" ? 0.004 : 0.1;
+  let next = -1;
+  for (let i = 0; i < 24 && i < wx.hourly.precipitation.length; i++) {
+    if ((wx.hourly.precipitation[i] ?? 0) >= thr && (wx.hourly.precipitation_probability[i] ?? 0) >= 40) { next = i; break; }
+  }
+  text(next < 0 ? "Dry next 24 h" : next === 0 ? "Rain now" : `Rain expected in ${next} h`, cx, y0 + 114, 15);
+}
+
+function summaryBar(wx, box) {
+  const [x0, y0, x1, y1] = panel(box), cy = (y0 + y1) / 2;
+  const desc = WMO_TEXT[wx.current.weather_code] || "Unknown";
+  const uv = wx.current.uv_index;
+  const right = uv != null ? `UV ${fmtG(uv)} ${uvLabel(uv)}` : "";
+  text(right, x1 - 14, cy, 18, true, "r");
+  text(desc, x0 + 14, cy, fit(desc, x1 - x0 - textW(right, 18, true) - 50, 28, true), true, "l");
+}
+
+function dateBlock(wx, box) {
+  const [x0, y0, x1, y1] = panel(box), cx = (x0 + x1) / 2, n = wx.now;
+  const date = `${DAYS[n.getUTCDay()].slice(0, 3)} ${pad(n.getUTCDate())}-${MONTHS[n.getUTCMonth()]}-${n.getUTCFullYear()}`;
+  text(date, cx, y0 + 30, 30, true);
+  const f = wx.fetchedAt;
+  text(`Updated: ${pad(f.getHours())}:${pad(f.getMinutes())}:${pad(f.getSeconds())}`, cx, y1 - 22, 19);
+}
+
+function sunMoonBlock(wx, box) {
+  const [x0, y0, x1, y1] = panel(box);
+  const rise = wx.daily.sunrise[0], set = wx.daily.sunset[0];
+  const mins = Math.round((set - rise) / 60e3);
+  const [phase, name] = moonInfo(new Date());
+  [`${hhmm(rise)}  Sunrise`, `${hhmm(set)}  Sunset`, `${Math.floor(mins / 60)}h ${pad(mins % 60)}m  Daylight`, name]
+    .forEach((s, k) => text(s, x0 + 12, y0 + 14 + k * 19, 15, true, "l"));
+  moonPhase(x1 - 44, (y0 + y1) / 2, 30, phase, wx.location.lat < 0);
+}
+
+function hourlyStrip(wx, y0, y1, n = 12, step = 3) {
+  const hr = wx.hourly, u = wx.units, gap = 4;
+  const cw = (W - 2 * M - gap * (n - 1)) / n;
+  for (let k = 0; k < n; k++) {
+    const i = 1 + k * step;
+    if (i >= hr.time.length) break;
+    const x0 = M + k * (cw + gap), x1 = x0 + cw, cx = (x0 + x1) / 2;
+    strokeRect(x0, y0, x1, y1);
+    line([[x0, y0 + 24], [x1, y0 + 24]]);
+    text(hhmm(hr.time[i]), cx, y0 + 13, 16, true);
+    drawIcon(hr.weather_code[i], cx, y0 + 57, 62, !!hr.is_day[i]);
+    text(`${fmt(hr.temperature_2m[i])}°`, cx, y1 - 32, 19, true);
+    const s = `${fmt(hr.precipitation[i], u.rain === "in" ? 2 : 1)}${u.rain}  ${fmt(hr.precipitation_probability[i])}%`;
+    text(s, cx, y1 - 13, fit(s, cw - 8, 13));
+  }
+}
+
+function dailyStrip(wx, y0, y1) {
+  const dy = wx.daily, u = wx.units, gap = 4, n = Math.min(7, dy.time.length);
+  const cw = (W - 2 * M - gap * (n - 1)) / n;
+  for (let k = 0; k < n; k++) {
+    const x0 = M + k * (cw + gap), x1 = x0 + cw;
+    strokeRect(x0, y0, x1, y1);
+    line([[x0, y0 + 24], [x1, y0 + 24]]);
+    const label = k === 0 ? "Today" : k === 1 ? "Tomorrow" : DAYS[dy.time[k].getUTCDay()];
+    text(label, (x0 + x1) / 2, y0 + 13, 16, true);
+    drawIcon(dy.weather_code[k], x0 + 44, (y0 + 24 + y1) / 2, 70, true);
+    const tx = x0 + 86, tw = cw - 92;
+    const hl = `${fmt(dy.temperature_2m_max[k])}° / ${fmt(dy.temperature_2m_min[k])}°`;
+    text(hl, tx, y0 + 48, fit(hl, tw, 22, true), true, "l");
+    const rain = `${fmt(dy.precipitation_sum[k], u.rain === "in" ? 2 : 1)} ${u.rain}  ${fmt(dy.precipitation_probability_max[k])}%`;
+    text(rain, tx, y0 + 76, fit(rain, tw, 15), false, "l");
+    const extra = `UV ${fmt(dy.uv_index_max[k])}  ${fmt(dy.wind_speed_10m_max[k])} ${u.wind}`;
+    text(extra, tx, y0 + 98, fit(extra, tw, 14), false, "l");
+  }
+}
+
+function chart(box, title, times, values, mode, fixed, decimals, avgDecimals) {
+  const [x0, y0, x1, y1] = box;
+  const px0 = x0 + 44, py0 = y0 + 24, px1 = x1 - 10, py1 = y1 - 24;
+  const n = values.length, vals = values.filter(v => v != null);
+  let ticks, step, sums = null;
+  if (mode === "bars") {
+    sums = [];
+    for (let g = 0; g < n; g += 3) sums.push(values.slice(g, g + 3).reduce((a, v) => a + (v ?? 0), 0));
+    [ticks, step] = niceTicks(0, Math.max(...sums, fixed || 1));
+  } else if (fixed) {
+    step = (fixed[1] - fixed[0]) / 4;
+    ticks = [0, 1, 2, 3, 4].map(k => fixed[0] + k * step);
+  } else {
+    [ticks, step] = niceTicks(Math.min(...vals), Math.max(...vals));
+  }
+  const lo = ticks[0], hi = ticks[ticks.length - 1];
+  const nd = decimals ?? decimalsFor(step);
+  const X = i => px0 + (px1 - px0) * i / Math.max(n - 1, 1);
+  const Y = v => py1 - (py1 - py0) * (v - lo) / (hi - lo);
+
+  // title with the average of the plotted period
+  const avg = mean(sums || values);
+  const label = `${title}  avg ${fmt(avg, avgDecimals)}`;
+  text(label, (x0 + x1) / 2, y0 + 9, fit(label, x1 - x0 - 8, 15, true), true);
+
+  for (const t of ticks) {
+    const y = Y(t);
+    if (t !== lo && t !== hi) line([[px0, y], [px1, y]], 1, INK, [4, 4]);
+    text(t.toFixed(nd), px0 - 5, y, 13, false, "r");
+  }
+  times.slice(0, n).forEach((t, i) => {
+    if (t.getUTCHours() === 0 && i > 0) {
+      ctx.fillStyle = INK;
+      for (let y = py0; y < py1; y += 4) ctx.fillRect(X(i) - 0.5, y, 1, 1);
+      line([[X(i), py1], [X(i), py1 + 5]], 2);
+    }
+    if (t.getUTCHours() === 12) text(DAYS[t.getUTCDay()].slice(0, 3), X(i), py1 + 12, 13);
+  });
+
+  if (mode === "bars") {
+    const bw = (px1 - px0) / sums.length;
+    sums.forEach((s, g) => {
+      if (s <= 0) return;
+      const bx0 = px0 + g * bw + 1, bx1 = px0 + (g + 1) * bw - 1, by = Y(s);
+      hatch([[bx0, by], [bx1, by], [bx1, py1], [bx0, py1]], 2);
+      ctx.lineWidth = 1; ctx.strokeStyle = INK; ctx.strokeRect(bx0 + 0.5, by + 0.5, bx1 - bx0 - 1, py1 - by - 1);
+    });
+  } else {
+    const pts = [];
+    values.forEach((v, i) => { if (v != null) pts.push([X(i), Y(v)]); });
+    if (mode === "area" && pts.length > 1) hatch([[pts[0][0], py1], ...pts, [pts[pts.length - 1][0], py1]], 4);
+    if (pts.length > 1) line(pts, 2);
+  }
+
+  // average line + tag
+  if (avg != null) {
+    const ay = Y(avg);
+    ctx.fillStyle = PAPER;
+    line([[px0, ay], [px1, ay]], 2, INK, [10, 5]);
+    const tag = "avg", tw = textW(tag, 11, true) + 8;
+    const tx1 = px1 - 2, ty = Math.min(Math.max(ay, py0 + 8), py1 - 8);
+    ctx.fillStyle = INK; ctx.fillRect(tx1 - tw, ty - 7, tw, 14);
+    text(tag, tx1 - tw / 2, ty + 0.5, 11, true, "c", PAPER);
+  }
+  strokeRect(px0, py0, px1, py1);
+}
+
+function charts(wx, y0, y1, hours = 72) {
+  const hr = wx.hourly, u = wx.units, inch = u.rain === "in";
+  text(`${hours / 24}-Day Forecast Values`, W / 2, y0 + 10, 19, true);
+  const times = hr.time.slice(0, hours);
+  const specs = [
+    [`Temp (°${u.temp})`, hr.temperature_2m, "line", null, null, 1],
+    ["Humidity (%)", hr.relative_humidity_2m, "line", [0, 100], 0, 0],
+    ["Pressure (hPa)", hr.pressure_msl, "line", null, 0, 0],
+    [`Rain (${u.rain}/3h)`, hr.precipitation, "bars", inch ? 0.04 : 1, null, 2],
+    ["Clouds (%)", hr.cloud_cover, "area", [0, 100], 0, 0],
+  ];
+  const cw = (W - 2 * M) / specs.length;
+  specs.forEach(([title, values, mode, fixed, nd, avgNd], k) => {
+    const x0 = M + k * cw;
+    chart([x0, y0 + 24, x0 + cw, y1], title, times, values.slice(0, hours), mode, fixed, nd, avgNd);
+  });
+}
+
+function clear() { ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H); }
+
+function render(wx, status) {
+  clear();
+  header(wx, status);
+  windPanel(wx, [M, 44, 300, 340]);
+  conditionsPanel(wx, [300, 44, 556, 340]);
+  temperatureCell(wx, [556, 44, 776, 204]);
+  pressureCell(wx, [776, 44, 984, 204]);
+  precipCell(wx, [984, 44, W - M, 204]);
+  summaryBar(wx, [556, 204, W - M, 254]);
+  dateBlock(wx, [556, 254, 912, 340]);
+  sunMoonBlock(wx, [912, 254, W - M, 340]);
+  hourlyStrip(wx, 348, 476);
+  dailyStrip(wx, 484, 612);
+  charts(wx, 616, H - M);
+}
+
+function renderMessage(title, detail = "") {
+  clear();
+  strokeRect(M, M, W - M, H - M);
+  drawIcon(3, W / 2, H / 2 - 120, 160);
+  text(title, W / 2, H / 2 + 10, 34, true);
+  detail.split("\n").slice(0, 6).forEach((s, k) => text(s, W / 2, H / 2 + 60 + k * 26, fit(s, W - 80, 18)));
+}
+
+// ------------------------------------------------------------------ app
+const qs = new URLSearchParams(location.search);
+const state = {
+  city: qs.get("city") || store.get("wp.city") || "Berlin",
+  lat: qs.has("lat") ? +qs.get("lat") : null,
+  lon: qs.has("lon") ? +qs.get("lon") : null,
+  name: qs.get("name"),
+  units: qs.get("units") || store.get("wp.units") || "metric",
+  demo: qs.has("demo"),
+  refreshMin: Math.max(1, +(qs.get("refresh") || 15)),
+  loc: null,
+  last: null,
+  timer: null,
+  busy: false,
+};
+if (!UNIT_PARAMS[state.units]) state.units = "metric";
+
+const $city = document.getElementById("city"), $units = document.getElementById("units");
+$city.value = state.lat != null ? "" : state.city;
+$units.value = state.units;
+document.getElementById("every").textContent = state.refreshMin;
+
+function syncUrl() {
+  const p = new URLSearchParams();
+  if (state.lat != null) { p.set("lat", state.lat); p.set("lon", state.lon); if (state.name) p.set("name", state.name); }
+  else p.set("city", state.city);
+  if (state.units !== "metric") p.set("units", state.units);
+  if (state.demo) p.set("demo", "1");
+  if (qs.has("refresh")) p.set("refresh", state.refreshMin);
+  try { history.replaceState(null, "", `${location.pathname}?${p}`); } catch { /* file:// in some browsers */ }
+}
+
+async function resolveLocation() {
+  if (state.loc) return state.loc;
+  if (state.lat != null && state.lon != null) {
+    state.loc = { name: state.name || `${state.lat.toFixed(2)}, ${state.lon.toFixed(2)}`, lat: state.lat, lon: state.lon, country: "" };
+  } else if (state.demo) {
+    state.loc = { name: state.city === "Berlin" ? "Demo City" : state.city, lat: 52.52, lon: 13.41, country: "DE" };
+  } else {
+    state.loc = await geocode(state.city);
+  }
+  return state.loc;
+}
+
+function flash(draw) {
+  // imitate a full e-paper refresh: inverted -> black -> white -> new image
+  const seq = ["flash-invert", "flash-black", "flash-white"];
+  seq.forEach((cls, k) => setTimeout(() => { canvas.className = cls; if (k === 2) draw(); }, k * 110));
+  setTimeout(() => { canvas.className = ""; }, seq.length * 110);
+}
+
+async function update(withFlash = true) {
+  if (state.busy) return;
+  state.busy = true;
+  let draw;
+  try {
+    const loc = await resolveLocation();
+    const wx = state.demo ? demoWeather(loc, state.units) : await fetchWeather(loc, state.units);
+    state.last = wx;
+    draw = () => render(wx);
+    document.title = `${loc.name} ${fmt(wx.current.temperature_2m)}° · WeatherPanel`;
+  } catch (e) {
+    console.error(e);
+    const now = new Date();
+    if (state.last) draw = () => render(state.last, `! update failed ${pad(now.getHours())}:${pad(now.getMinutes())}`);
+    else draw = () => renderMessage("No weather data", `${e.message || e}\nRetrying automatically.`);
+  } finally {
+    state.busy = false;
+  }
+  withFlash && state.last ? flash(draw) : draw();
+  clearTimeout(state.timer);
+  state.timer = setTimeout(() => update(true), state.refreshMin * 60e3);
+}
+
+function changeLocation(patch) {
+  Object.assign(state, patch, { loc: null, last: null });
+  store.set("wp.city", state.city);
+  syncUrl();
+  update(false);
+}
+
+document.getElementById("cityForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const city = $city.value.trim();
+  if (city) changeLocation({ city, lat: null, lon: null, name: null, demo: false });
+});
+$units.addEventListener("change", () => {
+  state.units = $units.value;
+  store.set("wp.units", state.units);
+  syncUrl();
+  update(false);
+});
+document.getElementById("refresh").addEventListener("click", () => update(true));
+document.getElementById("geo").addEventListener("click", () => {
+  if (!navigator.geolocation) return alert("Geolocation is not available in this browser.");
+  navigator.geolocation.getCurrentPosition(
+    p => changeLocation({ lat: +p.coords.latitude.toFixed(4), lon: +p.coords.longitude.toFixed(4), name: "My location", demo: false }),
+    err => alert(`Could not get location: ${err.message}`),
+    { timeout: 10000 });
+});
+document.addEventListener("keydown", e => {
+  if (e.target.matches("input, select")) return;
+  if (e.key === "r" || e.key === "R") update(true);
+  if (e.key === "f" || e.key === "F") {
+    const el = document.getElementById("device");
+    document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.();
+  }
+});
+document.addEventListener("visibilitychange", () => {
+  // browsers throttle timers in background tabs; catch up when the tab is shown again
+  if (!document.hidden && state.last && Date.now() - state.last.fetchedAt > state.refreshMin * 60e3) update(true);
+});
+
+setupCanvas();
+renderMessage("Loading...", "Fetching weather from Open-Meteo");
+syncUrl();
+update(false);
+</script>
+</body>
+</html>
