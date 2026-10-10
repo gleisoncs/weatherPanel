@@ -26,7 +26,7 @@ Open-Meteo directly, so no server code is needed: upload the file to any static 
 `python -m http.server` and open http://localhost:8000.
 
 URL parameters: `?city=Lisbon`, `?lat=-23.55&lon=-46.63&name=Sao%20Paulo`, `&units=imperial`,
-`&refresh=10` (minutes), `&demo=1`. The page also has a city box, a "My location" button
+`&refresh=10` (minutes), `&demo=1`, `&pixel=1|1.5|2` (pixels: normal, fine, medium). The page also has a city box, a "My location" button, a pixel size selector
 and a units selector. Keys: `R` refresh, `F` fullscreen.
 
 ## Run

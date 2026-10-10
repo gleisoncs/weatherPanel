@@ -60,6 +60,9 @@
     width: 100%;
     height: auto;
     aspect-ratio: 1200 / 825;
+    /* show the panel's real pixels instead of smoothing them, like an e-paper screen */
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
     background: #e6e6df;
   }
   .device { position: relative; }
@@ -83,6 +86,11 @@
       <button type="submit">Go</button>
     </form>
     <button id="geo" type="button" title="Use my location">My location</button>
+    <select id="pixel" aria-label="Pixel size" title="E-paper pixel size">
+      <option value="1">Pixels: normal</option>
+      <option value="1.5">Pixels: fine</option>
+      <option value="2">Pixels: medium</option>
+    </select>
     <select id="units" aria-label="Units">
       <option value="metric">Metric (°C, km/h, mm)</option>
       <option value="imperial">Imperial (°F, mph, in)</option>
@@ -101,6 +109,13 @@
 "use strict";
 // ------------------------------------------------------------------ config
 const W = 1200, H = 825, M = 8;
+// The layout is designed at 1200x825 but drawn on a smaller "screen" (default 800x550, like a 7.5" e-paper
+// panel), then enlarged with hard pixels. The "Pixels" selector (or ?pixel=1|1.5|2) picks the size;
+// 1 = normal: smooth, full-resolution drawing with no pixel effect.
+const PIXEL_OPTIONS = [1, 1.5, 2];
+const smooth = () => PIXEL === 1;
+const nearestPixel = v => PIXEL_OPTIONS.reduce((a, b) => Math.abs(b - v) < Math.abs(a - v) ? b : a);
+let PIXEL = 1;
 const INK = "#222226", PAPER = "#e6e6df";
 const GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search";
 const FORECAST_URL = "https://api.open-meteo.com/v1/forecast";
@@ -324,11 +339,39 @@ const canvas = document.getElementById("panel");
 let ctx;
 
 function setupCanvas() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // pixel modes draw at a low resolution on purpose so pixels stay visible when scaled up;
+  // normal mode draws at the screen's full resolution
+  const scale = smooth() ? Math.min(window.devicePixelRatio || 1, 2) : 1 / PIXEL;
+  canvas.width = Math.round(W * scale);
+  canvas.height = Math.round(H * scale);
+  canvas.style.imageRendering = smooth() ? "auto" : "";
+  ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+}
+
+// E-paper look: snap every pixel to ink or paper (no anti-aliasing) and add a faint, fixed paper grain.
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const INK_RGB = hexRgb(INK), PAPER_RGB = hexRgb(PAPER);
+let grain = null;
+function epaper() {
+  if (smooth()) return;
+  const cw = canvas.width, ch = canvas.height;
+  const img = ctx.getImageData(0, 0, cw, ch), px = img.data;
+  if (!grain) {
+    grain = new Int8Array(cw * ch);
+    let seed = 12345;
+    for (let i = 0; i < grain.length; i++) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      grain[i] = (seed >> 16) % 9 - 4;   // -4..4 levels
+    }
+  }
+  const cut = INK_RGB[1] + 0.62 * (PAPER_RGB[1] - INK_RGB[1]);   // lean towards ink so thin strokes survive
+  for (let i = 0, p = 0; i < px.length; i += 4, p++) {
+    const lum = 0.3 * px[i] + 0.59 * px[i + 1] + 0.11 * px[i + 2];
+    const c = lum < cut ? INK_RGB : PAPER_RGB, g = lum < cut ? 0 : grain[p];
+    px[i] = c[0] + g; px[i + 1] = c[1] + g; px[i + 2] = c[2] + g; px[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 const font = (size, bold) => `${bold ? "bold " : ""}${size}px Arial, "Helvetica Neue", Helvetica, "Liberation Sans", sans-serif`;
@@ -372,7 +415,7 @@ function polygon(pts, color = INK) {
   ctx.fillStyle = color; ctx.fill();
 }
 
-const patterns = {};
+let patterns = {};
 function pattern(density) {
   if (!patterns[density]) {
     const c = document.createElement("canvas");
@@ -381,7 +424,10 @@ function pattern(density) {
     p.fillStyle = PAPER; p.fillRect(0, 0, 2, 2);
     p.fillStyle = INK; p.fillRect(0, 0, 1, 1);
     if (density === 2) p.fillRect(1, 1, 1, 1);
-    patterns[density] = ctx.createPattern(c, "repeat");
+    const pat = ctx.createPattern(c, "repeat");
+    const ps = smooth() ? 1 : PIXEL;   // pixel modes: one dot per e-paper pixel
+    pat.setTransform(new DOMMatrix([ps, 0, 0, ps, 0, 0]));
+    patterns[density] = pat;
   }
   return patterns[density];
 }
@@ -839,6 +885,9 @@ const state = {
 if (!UNIT_PARAMS[state.units]) state.units = "metric";
 
 const $city = document.getElementById("city"), $units = document.getElementById("units");
+const $pixel = document.getElementById("pixel");
+PIXEL = nearestPixel(+(qs.get("pixel") || store.get("wp.pixel") || 1) || 1);
+$pixel.value = String(PIXEL);
 $city.value = state.lat != null ? "" : state.city;
 $units.value = state.units;
 document.getElementById("every").textContent = state.refreshMin;
@@ -849,6 +898,7 @@ function syncUrl() {
   else p.set("city", state.city);
   if (state.units !== "metric") p.set("units", state.units);
   if (state.demo) p.set("demo", "1");
+  if (PIXEL !== 1) p.set("pixel", PIXEL);
   if (qs.has("refresh")) p.set("refresh", state.refreshMin);
   try { history.replaceState(null, "", `${location.pathname}?${p}`); } catch { /* file:// in some browsers */ }
 }
@@ -874,6 +924,7 @@ function swap(draw) {
   overlay.style.transition = "none";
   overlay.style.opacity = "1";
   draw();
+  epaper();
   overlay.getBoundingClientRect(); // commit opacity 1 before starting the fade
   overlay.style.transition = "opacity 0.5s ease";
   overlay.style.opacity = "0";
@@ -899,6 +950,7 @@ async function update() {
   } finally {
     state.busy = false;
   }
+  state.lastDraw = draw;
   swap(draw);
   clearTimeout(state.timer);
   state.timer = setTimeout(() => update(), state.refreshMin * 60e3);
@@ -915,6 +967,15 @@ document.getElementById("cityForm").addEventListener("submit", e => {
   e.preventDefault();
   const city = $city.value.trim();
   if (city) changeLocation({ city, lat: null, lon: null, name: null, demo: false });
+});
+$pixel.addEventListener("change", () => {
+  // re-draw the current frame at the new pixel size; no new download needed
+  PIXEL = nearestPixel(+$pixel.value);
+  store.set("wp.pixel", String(PIXEL));
+  syncUrl();
+  grain = null;
+  patterns = {};
+  swap(() => { setupCanvas(); state.lastDraw(); });
 });
 $units.addEventListener("change", () => {
   state.units = $units.value;
@@ -944,7 +1005,9 @@ document.addEventListener("visibilitychange", () => {
 });
 
 setupCanvas();
-renderMessage("Loading...", "Fetching weather from Open-Meteo");
+state.lastDraw = () => renderMessage("Loading...", "Fetching weather from Open-Meteo");
+state.lastDraw();
+epaper();
 syncUrl();
 update();
 </script>
