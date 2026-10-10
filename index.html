@@ -8,16 +8,14 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23e6e6df'/%3E%3Cpath d='M9 23h14a5 5 0 0 0 0-10 7 7 0 0 0-13 2 4 4 0 0 0-1 8z' fill='none' stroke='%23222226' stroke-width='2.5'/%3E%3C/svg%3E">
 <style>
   :root {
-    --page: #cfccc3;
+    /* the whole page uses the panel's paper colour, in light and dark mode alike */
+    --page: #e6e6df;
     --bezel-edge: #bdbab1;
-    --text: #2a2a2e;
+    --text: #222226;
     --muted: #5d5c58;
-    --field: #f7f6f2;
+    --field: #f1f1eb;
+    color-scheme: light;
   }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { --page: #1d1d1f; --text: #e6e5e0; --muted: #a09f9a; --field: #2a2a2d; }
-  }
-  :root[data-theme="dark"] { --page: #1d1d1f; --text: #e6e5e0; --muted: #a09f9a; --field: #2a2a2d; }
 
   * { box-sizing: border-box; }
   html, body { margin: 0; }
