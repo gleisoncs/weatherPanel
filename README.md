@@ -1,5 +1,7 @@
 # WeatherPanel
 
+**Live demo:** https://gleisoncs.github.io/weatherPanel/
+
 E-paper style weather station in Python. Draws a 1200x825 black & white frame
 (boxed panels, line-art icons, dithered charts) and shows it in a window that
 looks and refreshes like an e-paper display. Data comes from
